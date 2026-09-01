@@ -9,13 +9,15 @@ OpenGraph JSON/ZIP
 → Terraform Resource·IAM 관계 생성
 ```
 
-이 도구는 AWS API에 연결하거나 Terraform을 실행하지 않습니다.
+기본 Offline 모드는 AWS API에 연결하지 않습니다. `--source-profile`을 명시한
+경우에만 읽기 전용 Context API를 호출합니다. Terraform은 어느 모드에서도 실행하지
+않습니다.
 
 #### 실행 환경
 
 - Python 3.10 이상
 - 외부 Python 패키지 불필요
-- AWS 자격증명 불필요
+- Offline 변환 시 AWS 자격증명 불필요
 - Terraform·Docker 불필요
 
 #### 사용법
@@ -34,6 +36,38 @@ py ".\awshound_pipeline\graph2terraform.py" `
   --output ".\generated-terraform" `
   --scenario lambda-004
 ```
+
+#### 선택적 AWS Context 수집
+
+그래프에 부족한 Resource 설정을 원본 AWS의 읽기 API로 보충하려면 AWS CLI
+Profile을 지정합니다.
+
+권장 방식인 IAM Identity Center(SSO):
+
+```powershell
+aws configure sso --profile awshound-readonly
+aws sso login --profile awshound-readonly
+aws sts get-caller-identity --profile awshound-readonly
+```
+
+승인된 Access Key를 사용해야 하는 실습 환경:
+
+```powershell
+aws configure --profile awshound-readonly
+```
+
+Access Key는 AWS CLI Prompt에만 입력하고 Repository·JSON·Terraform에 기록하지
+않습니다.
+
+```powershell
+py ".\awshound_pipeline\graph2terraform.py" `
+  --input "C:\path\graph.zip" `
+  --output ".\generated-terraform" `
+  --source-profile awshound-readonly
+```
+
+Profile Account ID가 Graph의 Source Account ID와 다르면 중단합니다. 수집 결과는
+`context-evidence.json`에 저장됩니다.
 
 #### 생성 결과
 
@@ -55,7 +89,7 @@ generated-terraform/
 
 다음 작업은 수행하지 않습니다.
 
-- AWS API 호출
+- AWS Resource 생성·변경 API 호출
 - Terraform `init`, `plan`, `apply`
 - AWS Resource 생성·변경
 - 공격 실행
@@ -79,10 +113,9 @@ Terraform State, 실제 `terraform.tfvars`, Artifact와 생성 출력은 `.gitig
 py -m unittest discover -s .\awshound_pipeline\tests -v
 ```
 
-현재 자동 테스트 13개가 포함되어 있습니다.
+현재 자동 테스트 8개가 포함되어 있습니다.
 
 #### 문서
 
 - `awshound_pipeline/GRAPH2TERRAFORM.md`: 변환기 사용법
-- `docs/mirror-implementation-standard-v1.md`: Layer별 Mirror 선정 표준
 - `awshound_pipeline/schemas/AWSHOUND-LICENSE.txt`: 포함된 AWSHound Schema의 원본 라이선스

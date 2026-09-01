@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +47,36 @@ class Graph2TerraformTests(unittest.TestCase):
             (output / "user-file.txt").write_text("preserve", encoding="utf-8")
             with self.assertRaises(MODULE.ConversionError):
                 MODULE.convert(fixture, output, None, True)
+
+    def test_optional_source_profile_collects_read_only_context(self):
+        fixture = ROOT / "fixtures" / "synthetic-ssm-ec2-s3-graph.json"
+        fake_context = {
+            "identity": {
+                "Account": "111122223333",
+                "Arn": "arn:aws:iam::111122223333:role/readonly-collector",
+            },
+            "results": [],
+            "summary": {},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "generated"
+            with patch.object(MODULE.core, "collect_context", return_value=fake_context):
+                result = MODULE.convert(
+                    fixture,
+                    output,
+                    None,
+                    False,
+                    "source-readonly",
+                )
+            destination = Path(result["generated"][0]["directory"])
+            self.assertTrue((destination / "context-evidence.json").is_file())
+            manifest = json.loads(
+                (destination / "conversion-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(manifest["safety"]["aws_connected"])
+            self.assertEqual(
+                manifest["safety"]["source_profile"], "source-readonly"
+            )
 
 
 if __name__ == "__main__":

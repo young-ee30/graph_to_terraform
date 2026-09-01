@@ -2,9 +2,12 @@
 
 AWSHound OpenGraph `graph.json` 또는 ZIP을 Terraform 소스 파일로만 변환하는 단독 CLI다.
 
-다음 작업은 수행하지 않는다.
+기본 Offline 모드는 AWS API에 연결하지 않는다. `--source-profile`을 지정하면 관련
+Node의 등록된 읽기 전용 Context API만 호출한다.
 
-- AWS API 연결
+다음 작업은 어느 모드에서도 수행하지 않는다.
+
+- AWS Resource 생성·변경 API
 - Terraform 실행
 - AWS Resource 배포
 - 공격 실행
@@ -28,6 +31,34 @@ py ".\awshound_pipeline\graph2terraform.py" `
   --scenario lambda-004
 ```
 
+#### AWS CLI Profile 연결
+
+IAM Identity Center(SSO) 권장:
+
+```powershell
+aws configure sso --profile awshound-readonly
+aws sso login --profile awshound-readonly
+aws sts get-caller-identity --profile awshound-readonly
+```
+
+승인된 실습용 Access Key Profile:
+
+```powershell
+aws configure --profile awshound-readonly
+```
+
+Profile 이름을 변환기에 전달:
+
+```powershell
+py ".\awshound_pipeline\graph2terraform.py" `
+  --input "C:\path\graph.zip" `
+  --output ".\generated-terraform" `
+  --source-profile awshound-readonly
+```
+
+Access Key는 AWS CLI Profile에만 저장하고 JSON·Terraform·Repository에는 넣지 않는다.
+Profile Account ID는 Graph Source Account ID와 일치해야 한다.
+
 #### 생성 파일
 
 ```text
@@ -40,6 +71,7 @@ generated-terraform/
    ├─ terraform.tfvars.example
    ├─ required-inputs.json
    ├─ terraform-coverage.json     # Generic 경로일 때
+   ├─ context-evidence.json       # --source-profile 사용 시
    ├─ conversion-manifest.json
    └─ fixtures/                   # 합성 코드가 필요할 때
 ```
