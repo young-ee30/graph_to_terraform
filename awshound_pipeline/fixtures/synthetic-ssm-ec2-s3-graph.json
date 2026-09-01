@@ -1,0 +1,168 @@
+{
+  "graph": {
+    "nodes": [
+      {
+        "id": "synthetic-account",
+        "kinds": ["AWS_Account"],
+        "properties": {
+          "arn": "arn:aws:iam::111122223333:root",
+          "account_id": "111122223333",
+          "name": "111122223333"
+        }
+      },
+      {
+        "id": "synthetic-starting-user",
+        "kinds": ["AWS_User"],
+        "properties": {
+          "arn": "arn:aws:iam::111122223333:user/synthetic-ssm-starting-user",
+          "account_id": "111122223333",
+          "user_name": "synthetic-ssm-starting-user",
+          "name": "111122223333:synthetic-ssm-starting-user",
+          "tags": "[{\"Key\":\"Purpose\",\"Value\":\"starting-user\"}]",
+          "inline_policies": "{\"synthetic-start-session\":{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"ssm:StartSession\",\"Resource\":\"arn:aws:ec2:us-east-1:111122223333:instance/i-0123456789abcdef0\"}]}}"
+        }
+      },
+      {
+        "id": "synthetic-ec2",
+        "kinds": ["AWS_EC2Instance"],
+        "properties": {
+          "arn": "arn:aws:ec2:us-east-1:111122223333:instance/i-0123456789abcdef0",
+          "account_id": "111122223333",
+          "region": "us-east-1",
+          "instance_id": "i-0123456789abcdef0",
+          "instance_type": "t3.micro",
+          "image_id": "ami-0123456789abcdef0",
+          "vpc_id": "vpc-0123456789abcdef0",
+          "subnet_id": "subnet-0123456789abcdef0",
+          "security_groups": "[{\"GroupId\":\"sg-0123456789abcdef0\",\"GroupName\":\"synthetic-ssm-sg\"}]",
+          "iam_instance_profile_arn": "arn:aws:iam::111122223333:instance-profile/synthetic-instance-profile",
+          "state": "running",
+          "name": "111122223333:synthetic-ssm-target"
+        }
+      },
+      {
+        "id": "synthetic-instance-role",
+        "kinds": ["AWS_Role"],
+        "properties": {
+          "arn": "arn:aws:iam::111122223333:role/synthetic-s3-access-role",
+          "account_id": "111122223333",
+          "role_name": "synthetic-s3-access-role",
+          "name": "111122223333:synthetic-s3-access-role",
+          "assume_role_policy_document": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+        }
+      },
+      {
+        "id": "synthetic-s3-policy",
+        "kinds": ["AWS_Policy"],
+        "properties": {
+          "arn": "arn:aws:iam::111122223333:policy/synthetic-s3-read-policy",
+          "account_id": "111122223333",
+          "policy_name": "synthetic-s3-read-policy",
+          "name": "111122223333:synthetic-s3-read-policy",
+          "default_version_id": "v1",
+          "policy_document": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::synthetic-sensitive-bucket/flag.txt\"}]}"
+        }
+      },
+      {
+        "id": "synthetic-bucket",
+        "kinds": ["AWS_S3Bucket"],
+        "properties": {
+          "arn": "arn:aws:s3:::synthetic-sensitive-bucket",
+          "account_id": "111122223333",
+          "region": "us-east-1",
+          "name": "111122223333:synthetic-sensitive-bucket",
+          "ownership_controls": "BucketOwnerEnforced",
+          "public_access_block": "{\"BlockPublicAcls\":true,\"IgnorePublicAcls\":true,\"BlockPublicPolicy\":true,\"RestrictPublicBuckets\":true}"
+        }
+      },
+      {
+        "id": "synthetic-flag-object",
+        "kinds": ["AWS_S3Object"],
+        "properties": {
+          "arn": "arn:aws:s3:::synthetic-sensitive-bucket/flag.txt",
+          "account_id": "111122223333",
+          "region": "us-east-1",
+          "bucket_arn": "arn:aws:s3:::synthetic-sensitive-bucket",
+          "bucket_name": "synthetic-sensitive-bucket",
+          "name": "111122223333:synthetic-sensitive-bucket/flag.txt",
+          "size": 32,
+          "storage_class": "STANDARD"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "kind": "AWS_Contains",
+        "start": {"value": "synthetic-account"},
+        "end": {"value": "synthetic-starting-user"},
+        "properties": {"is_traversable": true}
+      },
+      {
+        "kind": "AWS_Contains",
+        "start": {"value": "synthetic-account"},
+        "end": {"value": "synthetic-ec2"},
+        "properties": {"is_traversable": true}
+      },
+      {
+        "kind": "AWS_Contains",
+        "start": {"value": "synthetic-account"},
+        "end": {"value": "synthetic-instance-role"},
+        "properties": {"is_traversable": true}
+      },
+      {
+        "kind": "AWS_Contains",
+        "start": {"value": "synthetic-account"},
+        "end": {"value": "synthetic-s3-policy"},
+        "properties": {"is_traversable": true}
+      },
+      {
+        "kind": "AWS_Contains",
+        "start": {"value": "synthetic-account"},
+        "end": {"value": "synthetic-bucket"},
+        "properties": {"is_traversable": true}
+      },
+      {
+        "kind": "AWS_Contains",
+        "start": {"value": "synthetic-bucket"},
+        "end": {"value": "synthetic-flag-object"},
+        "properties": {"is_traversable": true}
+      },
+      {
+        "kind": "AWS_SSMCanStartSession",
+        "start": {"value": "synthetic-starting-user"},
+        "end": {"value": "synthetic-ec2"},
+        "properties": {
+          "is_traversable": true,
+          "allow_sources": "synthetic-start-session/0",
+          "conditions": ""
+        }
+      },
+      {
+        "kind": "AWS_RunsAs",
+        "start": {"value": "synthetic-ec2"},
+        "end": {"value": "synthetic-instance-role"},
+        "properties": {"is_traversable": true}
+      },
+      {
+        "kind": "AWS_HasPolicy",
+        "start": {"value": "synthetic-instance-role"},
+        "end": {"value": "synthetic-s3-policy"},
+        "properties": {"is_traversable": false}
+      },
+      {
+        "kind": "AWS_CanGetObject",
+        "start": {"value": "synthetic-instance-role"},
+        "end": {"value": "synthetic-flag-object"},
+        "properties": {
+          "is_traversable": false,
+          "allow_sources": "arn:aws:iam::111122223333:policy/synthetic-s3-read-policy/0",
+          "conditions": ""
+        }
+      }
+    ]
+  },
+  "metadata": {
+    "source_kind": "AWS",
+    "fixture": "synthetic-ssm-ec2-s3"
+  }
+}

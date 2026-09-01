@@ -1,0 +1,41 @@
+# Local credentials and generated artifacts
+.aws/
+outputs/*
+!outputs/.gitkeep
+vendor/AWSHound/
+*.log
+
+# Python caches
+**/__pycache__/
+*.py[cod]
+
+# Terraform local state and sensitive variable files
+**/.terraform/
+**/.mirrorctl/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+*.auto.tfvars
+*.auto.tfvars.json
+
+# Generated mirror/conversion runs
+generated-terraform/
+mirror-runs/
+extracted-paths/
+awshound_pipeline/live-test/
+awshound_pipeline/generated*/
+artifacts/
+
+# Environment and private-key material
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+
+# Local/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
