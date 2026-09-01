@@ -361,6 +361,68 @@ class ConverterCoreTests(unittest.TestCase):
             "REDACTED_EPHEMERAL_DOWNLOAD_URL",
         )
 
+    def test_context_inventory_keeps_services_in_same_cluster(self):
+        cluster = "arn:aws:ecs:ap-northeast-2:111122223333:cluster/test"
+        evidence = {
+            "results": [
+                {
+                    "status": "COLLECTED",
+                    "request": {"operation": "describe-services"},
+                    "response": {
+                        "services": [
+                            {
+                                "clusterArn": cluster,
+                                "serviceArn": "arn:aws:ecs:ap-northeast-2:111122223333:service/test/frontend",
+                                "serviceName": "frontend",
+                            },
+                            {
+                                "clusterArn": cluster,
+                                "serviceArn": "arn:aws:ecs:ap-northeast-2:111122223333:service/test/order",
+                                "serviceName": "order",
+                            },
+                        ]
+                    },
+                }
+            ]
+        }
+        inventory = MODULE.context_inventory(evidence)
+        self.assertEqual(
+            {value["serviceName"] for value in inventory["ecs_services"]},
+            {"frontend", "order"},
+        )
+
+    def test_empty_default_sg_and_gateway_endpoint_routes_are_not_blockers(self):
+        evidence = {
+            "results": [
+                {
+                    "status": "COLLECTED",
+                    "request": {"operation": "describe-vpcs"},
+                    "response": {"Vpcs": [{"VpcId": "vpc-test", "CidrBlock": "10.0.0.0/16"}]},
+                },
+                {
+                    "status": "COLLECTED",
+                    "request": {"operation": "describe-security-groups"},
+                    "response": {"SecurityGroups": [{"GroupId": "sg-default", "GroupName": "default", "VpcId": "vpc-test", "IpPermissions": [], "IpPermissionsEgress": []}]},
+                },
+                {
+                    "status": "COLLECTED",
+                    "request": {"operation": "describe-route-tables"},
+                    "response": {"RouteTables": [{"RouteTableId": "rtb-test", "VpcId": "vpc-test", "Associations": [], "Routes": [{"DestinationPrefixListId": "pl-test", "GatewayId": "vpce-test", "State": "active"}]}]},
+                },
+                {
+                    "status": "COLLECTED",
+                    "request": {"operation": "describe-vpc-endpoints"},
+                    "response": {"VpcEndpoints": [{"VpcEndpointId": "vpce-test", "VpcId": "vpc-test", "VpcEndpointType": "Gateway", "ServiceName": "com.amazonaws.ap-northeast-2.s3", "RouteTableIds": ["rtb-test"]}]},
+                },
+            ]
+        }
+        _, _, _, coverage, blockers = MODULE.render_network_from_context(evidence)
+        self.assertFalse(blockers)
+        self.assertIn(
+            "SAFE_DEFAULT_DENY_AUTO_CREATED",
+            {value["status"] for value in coverage},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -208,6 +208,7 @@ def convert(
     mirror_spec: dict[str, object] | None = None,
     input_label: str | None = None,
     package_spec_raw: bytes | None = None,
+    context_file: Path | None = None,
 ) -> dict[str, object]:
     document, raw = core.load_graph(input_path)
     nodes, edges, scenarios = selected_scenarios(document, wanted)
@@ -266,15 +267,34 @@ def convert(
         destination.mkdir(parents=True, exist_ok=False)
 
         requests = core.context_plan(scenario, nodes, edges, mirror_spec)
-        context_evidence = (
-            core.collect_context(
+        context_evidence = None
+        if context_file:
+            try:
+                context_evidence = json.loads(
+                    context_file.read_text(encoding="utf-8-sig")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ConversionError(
+                    f"invalid context evidence file: {context_file}"
+                ) from exc
+            context_account = str(
+                context_evidence.get("identity", {}).get("Account") or ""
+            )
+            if (
+                scenario.source_account_id != "UNKNOWN"
+                and context_account
+                and context_account != scenario.source_account_id
+            ):
+                raise ConversionError(
+                    f"context account mismatch: graph={scenario.source_account_id}, "
+                    f"context={context_account}"
+                )
+        elif source_profile:
+            context_evidence = core.collect_context(
                 requests,
                 source_profile,
                 scenario.source_account_id,
             )
-            if source_profile
-            else None
-        )
         files = core.terraform_files(
             scenario,
             nodes,
@@ -343,6 +363,7 @@ def convert(
             },
             "safety": {
                 "aws_connected": bool(source_profile),
+                "source_context_reused": bool(context_file),
                 "source_profile": source_profile,
                 "terraform_executed": False,
                 "resources_deployed": False,
@@ -377,6 +398,7 @@ def convert(
         "generated": generated,
         "notice": "Generation only. AWS and Terraform were not executed.",
         "source_context_collected": bool(source_profile),
+        "source_context_reused": bool(context_file),
     }
     write_json(output / "conversion-summary.json", summary)
     return summary
@@ -400,12 +422,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="scenario ID to generate; repeatable; default is all detected paths",
     )
-    parser.add_argument(
+    context_source = parser.add_mutually_exclusive_group()
+    context_source.add_argument(
         "--source-profile",
         help=(
             "optional AWS CLI profile used only for allow-listed read-only context APIs; "
             "when omitted, conversion uses graph properties only"
         ),
+    )
+    context_source.add_argument(
+        "--context-file",
+        type=Path,
+        help="reuse an existing context-evidence.json instead of calling AWS",
     )
     parser.add_argument(
         "--force",
@@ -436,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
             mirror_spec,
             input_label,
             package_spec_raw,
+            args.context_file,
         )
     except (
         ConversionError,
@@ -455,6 +484,11 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"Read-only AWS context was collected with profile {args.source_profile}. "
             "Terraform was not executed."
+        )
+    elif args.context_file:
+        print(
+            f"Existing read-only context was reused from {args.context_file}. "
+            "AWS and Terraform were not executed."
         )
     else:
         print("AWS was not contacted and Terraform was not executed.")

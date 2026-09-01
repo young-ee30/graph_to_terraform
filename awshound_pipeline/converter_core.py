@@ -1747,7 +1747,31 @@ def expand_context_response(
         for role_key in ("taskRoleArn", "executionRoleArn"):
             role_arn = str(task_definition.get(role_key) or "")
             if role_arn:
-                add_context_request(requests, service="iam", operation="get-role", arguments=["--role-name", role_arn.rsplit("/", 1)[-1]], reason=f"Confirm ECS {role_key} trust and metadata.")
+                role_name = role_arn.rsplit("/", 1)[-1]
+                add_context_request(requests, service="iam", operation="get-role", arguments=["--role-name", role_name], reason=f"Confirm ECS {role_key} trust and metadata.")
+                add_context_request(requests, service="iam", operation="list-role-policies", arguments=["--role-name", role_name], reason=f"Enumerate inline policies on the ECS {role_key}.")
+                add_context_request(requests, service="iam", operation="list-attached-role-policies", arguments=["--role-name", role_name], reason=f"Enumerate managed policies on the ECS {role_key}.")
+        return requests
+    if request.service == "iam" and request.operation == "list-role-policies":
+        requests = []
+        role_name = request_argument(request, "--role-name") or ""
+        for policy_name in response.get("PolicyNames", []):
+            add_context_request(requests, service="iam", operation="get-role-policy", arguments=["--role-name", role_name, "--policy-name", str(policy_name)], reason="Collect an ECS role inline policy document.")
+        return requests
+    if request.service == "iam" and request.operation == "list-attached-role-policies":
+        requests = []
+        for policy in response.get("AttachedPolicies", []):
+            policy_arn = str(policy.get("PolicyArn") or "")
+            if policy_arn and not policy_arn.startswith("arn:aws:iam::aws:policy/"):
+                add_context_request(requests, service="iam", operation="get-policy", arguments=["--policy-arn", policy_arn], reason="Collect customer-managed policy metadata attached to an ECS role.")
+        return requests
+    if request.service == "iam" and request.operation == "get-policy":
+        requests = []
+        policy = response.get("Policy", {})
+        policy_arn = str(policy.get("Arn") or request_argument(request, "--policy-arn") or "")
+        version_id = str(policy.get("DefaultVersionId") or "")
+        if policy_arn and version_id:
+            add_context_request(requests, service="iam", operation="get-policy-version", arguments=["--policy-arn", policy_arn, "--version-id", version_id], reason="Collect the effective customer-managed policy document.")
         return requests
     if (
         request.service == "resourcegroupstaggingapi"
@@ -2167,10 +2191,10 @@ def context_inventory(evidence: dict[str, Any] | None) -> dict[str, Any]:
                 (
                     str(value.get(field))
                     for field in (
-                        "clusterArn",
                         "serviceArn",
                         "taskArn",
                         "taskDefinitionArn",
+                        "clusterArn",
                         "imageDigest",
                         "LoadBalancerArn",
                         "ListenerArn",
@@ -3149,8 +3173,12 @@ resource "aws_subnet" "{address}" {{
 
     for group_id, value in model["security_groups"].items():
         if value.get("GroupName") == "default":
-            # A new VPC receives its own default SG; explicit path SGs are safer to recreate.
-            blockers.append(f"DEFAULT_SECURITY_GROUP_REVIEW:{group_id}")
+            # A new VPC receives its own default SG. An empty source default SG
+            # is already deny-all and needs no explicit cloned resource.
+            if value.get("IpPermissions") or value.get("IpPermissionsEgress"):
+                blockers.append(f"DEFAULT_SECURITY_GROUP_REVIEW:{group_id}")
+            else:
+                coverage.append({"type": "DEFAULT_SECURITY_GROUP", "source_id": group_id, "status": "SAFE_DEFAULT_DENY_AUTO_CREATED"})
             continue
         vpc_ref = vpc_refs.get(value.get("VpcId"))
         if not vpc_ref:
@@ -3298,6 +3326,13 @@ resource "aws_route_table_association" "{assoc_address}" {{
 ''')
         for index, route in enumerate(value.get("Routes", [])):
             if route.get("GatewayId") == "local" or route.get("State") == "blackhole":
+                continue
+            if (
+                route.get("DestinationPrefixListId")
+                and route.get("GatewayId") in endpoint_refs
+            ):
+                # Gateway endpoint routes are created by aws_vpc_endpoint via
+                # route_table_ids; emitting aws_route again would duplicate it.
                 continue
             destination_lines = []
             if route.get("DestinationCidrBlock"):
@@ -3514,6 +3549,91 @@ resource "aws_iam_role_policy_attachment" "mirror_ecs_execution" {
         for node_id, node in nodes.items()
         if node_id in addresses and node.primary_kind == "AWS_Role" and node.arn
     }
+    source_task_roles = sorted(
+        {
+            str(value.get("taskRoleArn"))
+            for value in task_definitions.values()
+            if value.get("taskRoleArn")
+        }
+    )
+    context_results = list((context_evidence or {}).get("results", []))
+    for source_role_arn in source_task_roles:
+        if source_role_arn in role_refs:
+            continue
+        role_name = source_role_arn.rsplit("/", 1)[-1]
+        address = network_tf_address("task_role", role_name)
+        blocks.append(f'''
+resource "aws_iam_role" "{address}" {{
+  name = substr("${{local.prefix}}-{address}", 0, 64)
+  assume_role_policy = jsonencode({{
+    Version = "2012-10-17"
+    Statement = [{{
+      Effect    = "Allow"
+      Principal = {{ Service = "ecs-tasks.amazonaws.com" }}
+      Action    = "sts:AssumeRole"
+    }}]
+  }})
+}}
+''')
+        role_refs[source_role_arn] = f"aws_iam_role.{address}.arn"
+        role_lists = {
+            str(item.get("request", {}).get("operation")): item
+            for item in context_results
+            if item.get("status") == "COLLECTED"
+            and item.get("request", {}).get("service") == "iam"
+            and request_argument(
+                ContextRequest(
+                    request_id="inventory",
+                    service="iam",
+                    operation=str(item.get("request", {}).get("operation") or ""),
+                    arguments=list(item.get("request", {}).get("arguments", [])),
+                    reason="inventory",
+                    required=False,
+                ),
+                "--role-name",
+            )
+            == role_name
+            and item.get("request", {}).get("operation")
+            in {"list-role-policies", "list-attached-role-policies"}
+        }
+        if set(role_lists) != {"list-role-policies", "list-attached-role-policies"}:
+            blockers.append(f"TASK_ROLE_PERMISSIONS_CONTEXT_REQUIRED:{role_name}")
+            continue
+        for item in context_results:
+            request_data = item.get("request", {})
+            arguments = list(request_data.get("arguments", []))
+            if (
+                item.get("status") != "COLLECTED"
+                or request_data.get("service") != "iam"
+                or request_data.get("operation") != "get-role-policy"
+                or "--role-name" not in arguments
+                or arguments[arguments.index("--role-name") + 1] != role_name
+            ):
+                continue
+            policy_name = str(item.get("response", {}).get("PolicyName") or "inline")
+            policy_document = item.get("response", {}).get("PolicyDocument") or {}
+            policy_address = network_tf_address("inline", f"{role_name}-{policy_name}")
+            blocks.append(f'''
+resource "aws_iam_role_policy" "{policy_address}" {{
+  name   = {json.dumps(policy_name)}
+  role   = aws_iam_role.{address}.id
+  policy = jsonencode({json.dumps(policy_document, ensure_ascii=False)})
+}}
+''')
+        attached = role_lists["list-attached-role-policies"].get("response", {}).get("AttachedPolicies", [])
+        for index, policy in enumerate(attached):
+            policy_arn = str(policy.get("PolicyArn") or "")
+            if policy_arn.startswith("arn:aws:iam::aws:policy/"):
+                attachment_address = network_tf_address("managed", f"{role_name}-{index}")
+                blocks.append(f'''
+resource "aws_iam_role_policy_attachment" "{attachment_address}" {{
+  role       = aws_iam_role.{address}.name
+  policy_arn = {json.dumps(policy_arn)}
+}}
+''')
+            elif policy_arn:
+                blockers.append(f"CUSTOM_MANAGED_TASK_POLICY_ADAPTER_REQUIRED:{policy_arn}")
+        coverage.append({"resource": source_role_arn, "status": "CONTEXT_REPRODUCIBLE", "kind": "ECS_TASK_ROLE"})
     task_definition_refs: dict[str, str] = {}
     for source_arn, definition in task_definitions.items():
         if source_arn not in {
@@ -3862,6 +3982,10 @@ def generic_terraform(
                 or ""
             )
             service_name = str(node.properties.get("service") or "").lower()
+            endpoint_path = str(node.properties.get("path") or "")
+            if service_name == "result" or endpoint_path.startswith("s3://"):
+                add_coverage(node, "EVIDENCE_ONLY", "This logical endpoint represents an S3 result path, not a deployable application workload.")
+                continue
             matched_service = next(
                 (
                     value
@@ -4343,10 +4467,6 @@ resource "aws_instance" "{address}" {{
                     "validation_status": validation_status,
                 }
             )
-            if edge.kind == "RNR_CanCompromiseWorkloadRole" and not runtime_proven:
-                blockers.append(
-                    f"RUNTIME_COMPROMISE_NOT_PROVEN:{node_name(selected_nodes[edge.start])}"
-                )
             continue
         source = selected_nodes[edge.start]
         info = catalog.get(edge.kind, {})
