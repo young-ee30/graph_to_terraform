@@ -57,10 +57,14 @@ class Node:
 
     @property
     def primary_kind(self) -> str:
-        # OpenGraph nodes may carry generic kinds before the AWS extension kind.
-        # Prefer the AWS semantic kind so classification does not depend on list order.
+        # OpenGraph nodes may carry generic kinds before an extension kind.
+        # Prefer AWS/RNR semantic kinds so classification does not depend on list order.
         return next(
-            (kind for kind in self.kinds if kind.startswith("AWS_")),
+            (
+                kind
+                for kind in self.kinds
+                if kind.startswith("AWS_") or kind.startswith("RNR_")
+            ),
             self.kinds[0] if self.kinds else "UNKNOWN",
         )
 
@@ -139,6 +143,18 @@ NODE_LAYERS: dict[str, str] = {
     "AWS_VPCEndpoint": "L4_NETWORK",
     "AWS_InternetGateway": "L4_NETWORK",
     "AWS_NATGateway": "L4_NETWORK",
+    # RNR integrated graph extension. These are evidence/model nodes produced
+    # by the application and network collectors, not native AWSHound kinds.
+    "RNR_Environment": "CONTEXT_REQUIRED",
+    "RNR_ExternalSource": "L4_NETWORK",
+    "RNR_LoadBalancer": "L4_NETWORK",
+    "RNR_WAFWebACL": "L4_NETWORK",
+    "RNR_SecurityGroup": "L4_NETWORK",
+    "RNR_Subnet": "L4_NETWORK",
+    "RNR_NetworkAcl": "L4_NETWORK",
+    "RNR_NetworkFinding": "L4_NETWORK",
+    "RNR_AppEndpoint": "L3_APPLICATION_DATA",
+    "RNR_CodeFinding": "L3_APPLICATION_DATA",
 }
 
 def infer_edge_layer(kind: str) -> str:
@@ -201,6 +217,16 @@ EDGE_LAYERS: dict[str, str] = {
     "AWS_CanGetParameter": "L3_APPLICATION_DATA",
     "AWS_CanGetSecretValue": "L3_APPLICATION_DATA",
     "AWS_CanDecrypt": "L3_APPLICATION_DATA",
+    "RNR_HasFinding": "L3_APPLICATION_DATA",
+    "RNR_CanCompromiseWorkloadRole": "L3_APPLICATION_DATA",
+    "RNR_SafeSimulationReachesRoleMetadata": "L3_APPLICATION_DATA",
+    "RNR_CanReach": "L4_NETWORK",
+    "RNR_ForwardsTo": "L4_NETWORK",
+    "RNR_ProtectedBy": "L4_NETWORK",
+    "RNR_AttachedSecurityGroup": "L4_NETWORK",
+    "RNR_ProtectedByNetworkAcl": "L4_NETWORK",
+    "RNR_LocatedIn": "L4_NETWORK",
+    "RNR_Contains": "CONTEXT_REQUIRED",
 }
 
 EDGE_ACTIONS: dict[str, str] = {
@@ -271,12 +297,37 @@ STRUCTURAL_EDGE_KINDS = {
     "AWS_RunsAs",
     "AWS_ClusterHasNodeGroup",
     "AWS_NodeGroupHasRole",
+    "RNR_Contains",
+    "RNR_ProtectedBy",
+    "RNR_AttachedSecurityGroup",
+    "RNR_ProtectedByNetworkAcl",
+    "RNR_LocatedIn",
 }
 
 PATH_CONNECTOR_EDGE_KINDS = {
     "AWS_RunsAs",
     "AWS_ClusterHasNodeGroup",
     "AWS_NodeGroupHasRole",
+    "RNR_CanReach",
+    "RNR_ForwardsTo",
+    "RNR_HasFinding",
+    "RNR_CanCompromiseWorkloadRole",
+    "RNR_SafeSimulationReachesRoleMetadata",
+}
+
+RNR_PATH_EDGE_KINDS = {
+    "RNR_CanReach",
+    "RNR_ForwardsTo",
+    "RNR_HasFinding",
+    "RNR_CanCompromiseWorkloadRole",
+    "RNR_SafeSimulationReachesRoleMetadata",
+}
+
+RNR_SUPPORT_EDGE_KINDS = {
+    "RNR_ProtectedBy",
+    "RNR_AttachedSecurityGroup",
+    "RNR_ProtectedByNetworkAcl",
+    "RNR_LocatedIn",
 }
 
 def official_edge_catalog() -> dict[str, dict[str, Any]]:
@@ -497,6 +548,7 @@ def supporting_nodes(
         "AWS_RunsAs",
         "AWS_ClusterHasNodeGroup",
         "AWS_NodeGroupHasRole",
+        *RNR_SUPPORT_EDGE_KINDS,
     }
     while changed:
         changed = False
@@ -581,6 +633,110 @@ def detect_scenarios(nodes: dict[str, Node], edges: list[Edge]) -> list[Scenario
         if nodes[edge.end].properties.get("arn") == "arn:aws:iam::aws:policy/AdministratorAccess"
     }
     scenarios: list[Scenario] = []
+
+    # A BloodHound query may export only one integrated RNR path.  RNR path
+    # relationships deliberately remain non-traversable until runtime proof,
+    # so their is_traversable flag must not be used as a discovery filter here.
+    # Connected path edges are treated as one hypothesis and nearby network
+    # control nodes are pulled in as supporting mirror context.
+    rnr_path_edges = [
+        edge
+        for edge in edges
+        if edge.kind in RNR_PATH_EDGE_KINDS
+        and (
+            edge.kind != "RNR_HasFinding"
+            or nodes[edge.end].primary_kind == "RNR_CodeFinding"
+        )
+    ]
+    rnr_unseen = {edge_identifier(edge): edge for edge in rnr_path_edges}
+    while rnr_unseen:
+        _, first = rnr_unseen.popitem()
+        component = [first]
+        component_nodes = {first.start, first.end}
+        changed = True
+        while changed:
+            changed = False
+            for key, edge in list(rnr_unseen.items()):
+                if edge.start in component_nodes or edge.end in component_nodes:
+                    component.append(edge)
+                    component_nodes.update((edge.start, edge.end))
+                    del rnr_unseen[key]
+                    changed = True
+
+        support = [
+            edge
+            for edge in edges
+            if edge.kind in RNR_SUPPORT_EDGE_KINDS
+            and edge.start in component_nodes
+        ]
+        support_nodes = set(component_nodes)
+        for edge in support:
+            support_nodes.add(edge.end)
+        # A selected subnet may point to its NACL in a second support hop.
+        second_hop = [
+            edge
+            for edge in edges
+            if edge.kind in RNR_SUPPORT_EDGE_KINDS
+            and edge.start in support_nodes
+            and edge.end not in support_nodes
+        ]
+        support.extend(second_hop)
+        for edge in second_hop:
+            support_nodes.add(edge.end)
+
+        indegree = {node_id: 0 for node_id in component_nodes}
+        outdegree = {node_id: 0 for node_id in component_nodes}
+        for edge in component:
+            indegree[edge.end] = indegree.get(edge.end, 0) + 1
+            outdegree[edge.start] = outdegree.get(edge.start, 0) + 1
+        starts = [node_id for node_id in component_nodes if indegree.get(node_id, 0) == 0]
+        targets = [node_id for node_id in component_nodes if outdegree.get(node_id, 0) == 0]
+        start = next(
+            (
+                node_id
+                for node_id in starts
+                if nodes[node_id].primary_kind == "RNR_ExternalSource"
+            ),
+            starts[0] if starts else first.start,
+        )
+        target = next(
+            (
+                node_id
+                for node_id in targets
+                if nodes[node_id].primary_kind
+                in {"AWS_S3Bucket", "AWS_S3Object", "AWS_SSMParameter", "AWS_Secret"}
+            ),
+            targets[0] if targets else component[-1].end,
+        )
+        digest = hashlib.sha1(
+            "\n".join(sorted(edge_identifier(edge) for edge in component)).encode("utf-8")
+        ).hexdigest()[:10]
+        runtime_proven = all(
+            edge.properties.get("runtime_exploit_proven") is True
+            for edge in component
+            if edge.kind == "RNR_CanCompromiseWorkloadRole"
+        )
+        scenarios.append(
+            make_scenario(
+                scenario_id=f"integrated-{digest}",
+                scenario_type="integrated_rnr_path",
+                start=start,
+                target=target,
+                seed_nodes=support_nodes,
+                path_edges=component + support,
+                nodes=nodes,
+                all_edges=edges,
+                mirror_mode="INTEGRATED_MINIMAL_MIRROR",
+                reasons=[
+                    "The input contains an RNR application/network path hypothesis.",
+                    (
+                        "Runtime compromise evidence is present."
+                        if runtime_proven
+                        else "Runtime compromise is not yet proven and must be validated in the mirror."
+                    ),
+                ],
+            )
+        )
 
     # Lambda UpdateFunctionCode + InvokeFunction -> admin execution role.
     for update in by_kind.get("AWS_CanUpdateLambdaCode", []):
@@ -812,6 +968,14 @@ def detect_scenarios(nodes: dict[str, Node], edges: list[Edge]) -> list[Scenario
             "\n".join(sorted(edge_identifier(edge) for edge in component)).encode("utf-8")
         ).hexdigest()[:10]
         mutating = any(edge_requires_mutation(edge.kind) for edge in component)
+        if all(
+            edge.kind in STRUCTURAL_EDGE_KINDS
+            or edge.kind in PATH_CONNECTOR_EDGE_KINDS
+            for edge in component
+        ):
+            # A RunsAs/containment connector without a permission edge is
+            # context, not an independently executable attack path.
+            continue
         scenarios.append(
             make_scenario(
                 scenario_id=f"generic-{digest}",
@@ -899,7 +1063,37 @@ def node_context_requests(node: Node, default_region: str) -> list[ContextReques
     kind = node.primary_kind
     name = node_name(node)
     region = node_region(node) or default_region
-    if kind == "AWS_User":
+    if kind == "RNR_LoadBalancer":
+        load_balancer_arn = node.arn
+        if load_balancer_arn:
+            add_context_request(requests, service="elbv2", operation="describe-load-balancers", arguments=["--load-balancer-arns", load_balancer_arn], reason="Confirm ALB scheme, type, VPC, subnets and security groups.", region=region)
+            add_context_request(requests, service="elbv2", operation="describe-listeners", arguments=["--load-balancer-arn", load_balancer_arn], reason="Confirm listener protocols, ports and default actions.", region=region)
+            add_context_request(requests, service="elbv2", operation="describe-target-groups", arguments=["--load-balancer-arn", load_balancer_arn], reason="Confirm target-group protocol, health check, target type and VPC.", region=region)
+    elif kind == "RNR_WAFWebACL":
+        waf_arn = node.arn or ""
+        match = re.match(
+            r"arn:[^:]+:wafv2:[^:]+:\d{12}:(?:regional|global)/webacl/([^/]+)/([^/]+)$",
+            waf_arn,
+        )
+        if match:
+            add_context_request(requests, service="wafv2", operation="get-web-acl", arguments=["--scope", "REGIONAL", "--name", match.group(1), "--id", match.group(2)], reason="Confirm WAF default action, rules and visibility configuration.", region=region)
+            add_context_request(requests, service="wafv2", operation="list-resources-for-web-acl", arguments=["--web-acl-arn", waf_arn, "--resource-type", "APPLICATION_LOAD_BALANCER"], reason="Confirm WAF-to-ALB association.", required=False, region=region)
+    elif kind == "RNR_SecurityGroup":
+        group_id = str(node.properties.get("group_id") or "")
+        if group_id:
+            add_context_request(requests, service="ec2", operation="describe-security-groups", arguments=["--group-ids", group_id], reason="Confirm RNR security-group VPC and rule metadata.", region=region)
+            add_context_request(requests, service="ec2", operation="describe-security-group-rules", arguments=["--filters", f"Name=group-id,Values={group_id}"], reason="Confirm normalized RNR security-group rules.", region=region)
+    elif kind == "RNR_Subnet":
+        subnet_id = str(node.properties.get("subnet_id") or "")
+        if subnet_id:
+            add_context_request(requests, service="ec2", operation="describe-subnets", arguments=["--subnet-ids", subnet_id], reason="Confirm RNR subnet VPC, CIDR, AZ and public-IP behavior.", region=region)
+            add_context_request(requests, service="ec2", operation="describe-route-tables", arguments=["--filters", f"Name=association.subnet-id,Values={subnet_id}"], reason="Confirm routes applied to the RNR subnet.", region=region)
+            add_context_request(requests, service="ec2", operation="describe-network-acls", arguments=["--filters", f"Name=association.subnet-id,Values={subnet_id}"], reason="Confirm NACL applied to the RNR subnet.", region=region)
+    elif kind == "RNR_NetworkAcl":
+        acl_id = str(node.properties.get("acl_id") or "")
+        if acl_id:
+            add_context_request(requests, service="ec2", operation="describe-network-acls", arguments=["--network-acl-ids", acl_id], reason="Confirm RNR network ACL entries, VPC and subnet associations.", region=region)
+    elif kind == "AWS_User":
         add_context_request(requests, service="iam", operation="get-user", arguments=["--user-name", name], reason="Confirm user state and permissions boundary.")
         add_context_request(requests, service="iam", operation="list-user-policies", arguments=["--user-name", name], reason="Enumerate inline policy names.")
         add_context_request(requests, service="iam", operation="list-attached-user-policies", arguments=["--user-name", name], reason="Enumerate attached managed policies.")
@@ -1177,6 +1371,51 @@ def expand_context_response(
             region=region,
             reason_prefix="EC2 dependency expansion",
         )
+    if request.service == "elbv2" and request.operation == "describe-load-balancers":
+        load_balancers = response.get("LoadBalancers", [])
+        return discovered_network_requests(
+            vpc_ids=[str(item.get("VpcId", "")) for item in load_balancers],
+            subnet_ids=[
+                str(zone.get("SubnetId", ""))
+                for item in load_balancers
+                for zone in item.get("AvailabilityZones", [])
+            ],
+            security_group_ids=[
+                str(group_id)
+                for item in load_balancers
+                for group_id in item.get("SecurityGroups", [])
+            ],
+            region=region,
+            reason_prefix="ALB dependency expansion",
+        )
+    if request.service == "elbv2" and request.operation == "describe-listeners":
+        requests: list[ContextRequest] = []
+        for listener in response.get("Listeners", []):
+            listener_arn = str(listener.get("ListenerArn") or "")
+            if listener_arn:
+                add_context_request(
+                    requests,
+                    service="elbv2",
+                    operation="describe-rules",
+                    arguments=["--listener-arn", listener_arn],
+                    reason="Confirm listener routing rules and conditions.",
+                    region=region,
+                )
+        return requests
+    if request.service == "elbv2" and request.operation == "describe-target-groups":
+        requests = []
+        for target_group in response.get("TargetGroups", []):
+            target_group_arn = str(target_group.get("TargetGroupArn") or "")
+            if target_group_arn:
+                add_context_request(
+                    requests,
+                    service="elbv2",
+                    operation="describe-target-health",
+                    arguments=["--target-group-arn", target_group_arn],
+                    reason="Confirm target identities, ports and health state.",
+                    region=region,
+                )
+        return requests
     if request.service == "eks" and request.operation == "describe-cluster":
         config = response.get("cluster", {}).get("resourcesVpcConfig", {})
         return discovered_network_requests(
@@ -2472,6 +2711,7 @@ def generic_terraform(
     blockers: list[str] = []
     required_inputs_list: list[dict[str, Any]] = []
     network_hcl, network_subnet_refs, network_sg_refs, network_coverage, network_blockers = render_network_from_context(context_evidence)
+    network_model = network_model_from_context(context_evidence)
     if network_hcl:
         blocks.append(network_hcl)
     blockers.extend(network_blockers)
@@ -2486,7 +2726,88 @@ def generic_terraform(
         address = addresses[node_id]
         slug = re.sub(r"[^a-z0-9-]+", "-", node_name(node).lower()).strip("-")[:28] or "resource"
         kind = node.primary_kind
-        if kind in {"AWS_Organization", "AWS_Account"}:
+        if kind == "RNR_Environment":
+            add_coverage(node, "EVIDENCE_ONLY", "Integrated-graph environment metadata selects the source account and Region; it is not a deployable resource.")
+        elif kind == "RNR_ExternalSource":
+            add_coverage(node, "EVIDENCE_ONLY", "The authorized source CIDR is evidence and may be referenced by recreated network controls.")
+        elif kind in {"RNR_CodeFinding", "RNR_NetworkFinding"}:
+            add_coverage(node, "EVIDENCE_ONLY", "Scanner findings describe the path but are not Terraform resources.")
+        elif kind == "RNR_AppEndpoint":
+            workload_id = str(
+                node.properties.get("workload_arn")
+                or node.properties.get("workload_id")
+                or ""
+            )
+            artifact = str(
+                node.properties.get("artifact_uri")
+                or node.properties.get("image_digest")
+                or ""
+            )
+            if workload_id and artifact:
+                add_coverage(node, "ADAPTER_INPUT_PRESENT", "Endpoint has an explicit workload binding and immutable artifact reference for a service-specific adapter.")
+                blockers.append(f"APP_WORKLOAD_ADAPTER_REQUIRED:{node_name(node)}")
+            else:
+                add_coverage(node, "ARTIFACT_REQUIRED", "Endpoint path/port alone cannot recreate the ECS/EC2/Lambda workload or application code.")
+                blockers.append(f"APP_WORKLOAD_BINDING_REQUIRED:{node_name(node)}")
+                required_inputs_list.append(
+                    {
+                        "name": f"app_workload_binding.{address}",
+                        "reason": "Provide workload type and ARN/ID plus an approved immutable artifact URI or image digest.",
+                    }
+                )
+        elif kind == "RNR_LoadBalancer":
+            load_balancer_arn = node.arn or ""
+            collected = any(
+                load_balancer_arn
+                and value.get("LoadBalancerArn") == load_balancer_arn
+                for item in (context_evidence or {}).get("results", [])
+                if item.get("status") == "COLLECTED"
+                for value in item.get("response", {}).get("LoadBalancers", [])
+            )
+            add_coverage(
+                node,
+                "CONTEXT_COLLECTED" if collected else "CONTEXT_REQUIRED",
+                "ALB ARN is usable for read-only listener, target-group and network collection; workload targets still require binding.",
+            )
+            blockers.append(f"LOAD_BALANCER_RENDERER_REQUIRED:{node_name(node)}")
+        elif kind == "RNR_WAFWebACL":
+            collected = any(
+                item.get("status") == "COLLECTED"
+                and item.get("request", {}).get("operation") == "get-web-acl"
+                for item in (context_evidence or {}).get("results", [])
+            )
+            add_coverage(
+                node,
+                "CONTEXT_COLLECTED" if collected else "CONTEXT_REQUIRED",
+                "WAF ARN is usable for read-only rule collection; referenced IP sets and managed rule dependencies must also be portable.",
+            )
+            blockers.append(f"WAF_RENDERER_REQUIRED:{node_name(node)}")
+        elif kind == "RNR_SecurityGroup":
+            group_id = str(node.properties.get("group_id") or "")
+            if group_id in network_sg_refs:
+                terraform_refs[node_id] = network_sg_refs[group_id]
+                resource_refs[node_id] = network_sg_refs[group_id]
+                add_coverage(node, "CONTEXT_REPRODUCIBLE", "Read-only API context supplied the VPC and normalized rules used by the network renderer.")
+            else:
+                add_coverage(node, "CONTEXT_REQUIRED", "Graph rules do not include the VPC ID needed to recreate this security group safely.")
+                blockers.append(f"SECURITY_GROUP_CONTEXT_REQUIRED:{group_id or node_name(node)}")
+        elif kind == "RNR_Subnet":
+            subnet_id = str(node.properties.get("subnet_id") or "")
+            if subnet_id in network_subnet_refs:
+                terraform_refs[node_id] = network_subnet_refs[subnet_id]
+                resource_refs[node_id] = network_subnet_refs[subnet_id]
+                add_coverage(node, "CONTEXT_REPRODUCIBLE", "Read-only API context supplied the VPC, route table and subnet attributes.")
+            else:
+                add_coverage(node, "CONTEXT_REQUIRED", "A source subnet ID is present, but its VPC and route dependencies require API context.")
+                blockers.append(f"SUBNET_CONTEXT_REQUIRED:{subnet_id or node_name(node)}")
+        elif kind == "RNR_NetworkAcl":
+            acl_id = str(node.properties.get("acl_id") or "")
+            if acl_id in network_model["network_acls"]:
+                add_coverage(node, "CONTEXT_REPRODUCIBLE", "Read-only API context supplied VPC and subnet associations for the NACL renderer.")
+            else:
+                add_coverage(node, "CONTEXT_REQUIRED", "Graph entries lack the VPC and subnet associations required by Terraform.")
+                blockers.append(f"NETWORK_ACL_CONTEXT_REQUIRED:{acl_id or node_name(node)}")
+        elif kind in {"AWS_Organization", "AWS_Account"}:
             add_coverage(node, "CONTEXT_ONLY", "Organization/account containers are not cloned into a target account.")
             terraform_refs[node_id] = "data.aws_caller_identity.current.account_id"
             resource_refs[node_id] = '"*"'
@@ -2843,6 +3164,29 @@ resource "aws_instance" "{address}" {{
     for edge in selected_edges:
         if edge.kind in STRUCTURAL_EDGE_KINDS:
             continue
+        if edge.kind in RNR_PATH_EDGE_KINDS:
+            runtime_proven = edge.properties.get("runtime_exploit_proven") is True
+            validation_status = str(
+                edge.properties.get("validation_status") or "UNSPECIFIED"
+            )
+            status = (
+                "RUNTIME_VERIFIED"
+                if runtime_proven
+                else "PATH_EVIDENCE_ONLY"
+            )
+            coverage_edges.append(
+                {
+                    "edge": edge_identifier(edge),
+                    "status": status,
+                    "actions": list(edge.properties.get("actions") or []),
+                    "validation_status": validation_status,
+                }
+            )
+            if edge.kind == "RNR_CanCompromiseWorkloadRole" and not runtime_proven:
+                blockers.append(
+                    f"RUNTIME_COMPROMISE_NOT_PROVEN:{node_name(selected_nodes[edge.start])}"
+                )
+            continue
         source = selected_nodes[edge.start]
         info = catalog.get(edge.kind, {})
         actions = list(info.get("actions", []))
@@ -2992,6 +3336,7 @@ def terraform_files(
         "role_chain_s3": lambda: role_chain_terraform(scenario),
         "ec2_passrole_spot_admin": lambda: ec2_terraform(scenario),
         "generic_awshound_path": lambda: generic_terraform(scenario, nodes, edges, context_evidence),
+        "integrated_rnr_path": lambda: generic_terraform(scenario, nodes, edges, context_evidence),
     }
     renderer = renderers.get(scenario.scenario_type)
     if not renderer:

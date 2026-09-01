@@ -113,7 +113,7 @@ def conversion_required_inputs(scenario: core.Scenario) -> dict[str, object]:
                 "reason": "This path creates a new EC2 instance and the graph has no source instance AMI.",
             }
         )
-    if scenario.scenario_type == "generic_awshound_path":
+    if scenario.scenario_type in {"generic_awshound_path", "integrated_rnr_path"}:
         inputs.extend(
             [
                 {
@@ -199,6 +199,14 @@ def convert(
             destination / "terraform.tfvars.example",
             core.tfvars_example(scenario),
         )
+        write_json(
+            destination / "context-plan.json",
+            {
+                "mode": "READ_ONLY",
+                "source_profile_required_to_execute": True,
+                "requests": [core.asdict(request) for request in requests],
+            },
+        )
         if context_evidence is not None:
             write_json(destination / "context-evidence.json", context_evidence)
         write_json(
@@ -227,7 +235,7 @@ def convert(
                 "attack_executed": False,
                 "source_secrets_copied": False,
             },
-            "files": sorted(written),
+            "files": sorted([*written, "context-plan.json"]),
         }
         write_json(destination / "conversion-manifest.json", manifest)
         generated.append(

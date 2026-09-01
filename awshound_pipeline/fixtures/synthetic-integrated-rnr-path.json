@@ -1,0 +1,48 @@
+{
+  "graph": {
+    "nodes": [
+      {
+        "id": "env",
+        "kinds": ["RNR_Environment"],
+        "properties": {"name": "LAB", "account_id": "111122223333", "region": "ap-northeast-2"}
+      },
+      {
+        "id": "external",
+        "kinds": ["RNR_ExternalSource"],
+        "properties": {"name": "AUTHORIZED CLIENT", "cidr": "192.0.2.10/32", "environmentid": "env"}
+      },
+      {
+        "id": "alb",
+        "kinds": ["RNR_LoadBalancer"],
+        "properties": {"name": "LAB ALB", "arn": "arn:aws:elasticloadbalancing:ap-northeast-2:111122223333:loadbalancer/app/lab/abc", "environmentid": "env", "port": 80, "protocol": "HTTP"}
+      },
+      {
+        "id": "endpoint",
+        "kinds": ["RNR_AppEndpoint"],
+        "properties": {"name": "LAB /FETCH", "service": "frontend", "path": "/fetch", "port": 80, "environmentid": "env"}
+      },
+      {
+        "id": "finding",
+        "kinds": ["RNR_CodeFinding"],
+        "properties": {"name": "USER CONTROLLED FETCH", "rule_id": "test-ssrf", "validation_status": "STATIC_ANALYSIS", "environmentid": "env"}
+      },
+      {
+        "id": "role",
+        "kinds": ["AWS_Role"],
+        "properties": {"name": "111122223333:LabRole", "role_name": "LabRole", "arn": "arn:aws:iam::111122223333:role/LabRole", "account_id": "111122223333", "assume_role_policy_document": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}]}}
+      },
+      {
+        "id": "sg",
+        "kinds": ["RNR_SecurityGroup"],
+        "properties": {"name": "LAB ALB SG", "group_id": "sg-0123456789abcdef0", "environmentid": "env"}
+      }
+    ],
+    "edges": [
+      {"kind": "RNR_CanReach", "start": {"value": "external"}, "end": {"value": "alb"}, "properties": {"is_traversable": false}},
+      {"kind": "RNR_ForwardsTo", "start": {"value": "alb"}, "end": {"value": "endpoint"}, "properties": {"is_traversable": false}},
+      {"kind": "RNR_HasFinding", "start": {"value": "endpoint"}, "end": {"value": "finding"}, "properties": {"is_traversable": false}},
+      {"kind": "RNR_CanCompromiseWorkloadRole", "start": {"value": "finding"}, "end": {"value": "role"}, "properties": {"is_traversable": false, "runtime_exploit_proven": false, "validation_status": "STATIC_CODE_PLUS_CONFIG_EVIDENCE"}},
+      {"kind": "RNR_AttachedSecurityGroup", "start": {"value": "alb"}, "end": {"value": "sg"}, "properties": {"is_traversable": false}}
+    ]
+  }
+}

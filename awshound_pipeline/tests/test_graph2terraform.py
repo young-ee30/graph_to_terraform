@@ -31,6 +31,7 @@ class Graph2TerraformTests(unittest.TestCase):
             self.assertTrue((destination / "outputs.tf").is_file())
             self.assertTrue((destination / "terraform.tfvars.example").is_file())
             self.assertTrue((destination / "required-inputs.json").is_file())
+            self.assertTrue((destination / "context-plan.json").is_file())
             self.assertFalse((destination / "terraform.tfvars").exists())
             manifest = json.loads(
                 (destination / "conversion-manifest.json").read_text(encoding="utf-8")
@@ -76,6 +77,16 @@ class Graph2TerraformTests(unittest.TestCase):
             self.assertTrue(manifest["safety"]["aws_connected"])
             self.assertEqual(
                 manifest["safety"]["source_profile"], "source-readonly"
+            )
+
+    def test_integrated_rnr_graph_generates_one_path(self):
+        fixture = ROOT / "fixtures" / "synthetic-integrated-rnr-path.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "generated"
+            result = MODULE.convert(fixture, output, None, False)
+            self.assertEqual(result["generated_count"], 1)
+            self.assertEqual(
+                result["generated"][0]["scenario_type"], "integrated_rnr_path"
             )
 
 

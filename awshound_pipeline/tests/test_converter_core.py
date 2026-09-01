@@ -108,6 +108,32 @@ class ConverterCoreTests(unittest.TestCase):
         self.assertTrue(coverage)
         self.assertFalse(blockers)
 
+    def test_integrated_rnr_path_detection_and_context(self):
+        fixture = ROOT / "fixtures" / "synthetic-integrated-rnr-path.json"
+        document, _ = MODULE.load_graph(fixture)
+        nodes, edges = MODULE.normalize_graph(document)
+        scenarios = MODULE.detect_scenarios(nodes, edges)
+        self.assertEqual(len(scenarios), 1)
+        scenario = scenarios[0]
+        self.assertEqual(scenario.scenario_type, "integrated_rnr_path")
+        self.assertEqual(
+            set(scenario.layers),
+            {"L1_IAM_CONTROL_PLANE", "L3_APPLICATION_DATA", "L4_NETWORK"},
+        )
+        operations = {
+            (request.service, request.operation)
+            for request in MODULE.context_plan(scenario, nodes, edges)
+        }
+        self.assertIn(("elbv2", "describe-load-balancers"), operations)
+        self.assertIn(("elbv2", "describe-listeners"), operations)
+        self.assertIn(("ec2", "describe-security-groups"), operations)
+        files = MODULE.terraform_files(scenario, nodes, edges, None)
+        coverage = json.loads(files["terraform-coverage.json"])
+        self.assertEqual(coverage["overall"], "CONTEXT_REQUIRED")
+        self.assertTrue(
+            any(value.startswith("APP_WORKLOAD_BINDING_REQUIRED") for value in coverage["blockers"])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

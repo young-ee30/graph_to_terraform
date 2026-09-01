@@ -1,5 +1,15 @@
 ### graph2terraform
 
+AWSHound `AWS_*` 그래프와 팀 통합 그래프의 `RNR_*` 경로를 모두 입력으로 받을 수 있다.
+RNR 경로는 네트워크 접근, 앱 엔드포인트, 코드 Finding, Workload Role의 연결을 하나의
+`integrated_rnr_path`로 분류한다. 쿼리로 특정 경로만 추출한 JSON도 동일한 OpenGraph
+구조와 참조 무결성을 유지하면 그대로 입력할 수 있다.
+
+RNR 노드 중 ALB·WAF·Security Group·Subnet·NACL은 식별자를 이용해 읽기 전용 Context
+API를 계획한다. AppEndpoint의 경로·포트만으로는 실행 주체와 배포물을 알 수 없으므로
+`workload_id/workload_arn`과 `artifact_uri/image_digest`가 없으면 Coverage Gate가
+Terraform Apply를 차단한다.
+
 AWSHound OpenGraph `graph.json` 또는 ZIP을 Terraform 소스 파일로만 변환하는 단독 CLI다.
 
 기본 Offline 모드는 AWS API에 연결하지 않는다. `--source-profile`을 지정하면 관련
