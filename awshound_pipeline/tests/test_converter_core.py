@@ -278,6 +278,8 @@ class ConverterCoreTests(unittest.TestCase):
         self.assertIn('resource "aws_ecs_service"', main)
         self.assertIn('resource "aws_lb"', main)
         self.assertIn('resource "aws_wafv2_web_acl"', main)
+        self.assertNotIn("default_action { block {} }", main)
+        self.assertNotIn("action { allow {} }", main)
 
     def test_generic_node_kinds_select_service_specific_apis(self):
         nodes = [

@@ -3872,12 +3872,16 @@ resource "aws_wafv2_web_acl" "mirror" {{
   name  = substr("${{local.prefix}}-web-acl", 0, 128)
   scope = "REGIONAL"
 
-  default_action {{ block {{}} }}
+  default_action {{
+    block {{}}
+  }}
 
   rule {{
     name     = "AllowAuthorizedClient"
     priority = 1
-    action {{ allow {{}} }}
+    action {{
+      allow {{}}
+    }}
     statement {{
       ip_set_reference_statement {{
         arn = aws_wafv2_ip_set.authorized_client.arn

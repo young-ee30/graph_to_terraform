@@ -212,6 +212,16 @@ def convert(
 ) -> dict[str, object]:
     document, raw = core.load_graph(input_path)
     nodes, edges, scenarios = selected_scenarios(document, wanted)
+    preloaded_context: dict[str, object] | None = None
+    if context_file:
+        try:
+            preloaded_context = json.loads(
+                context_file.read_text(encoding="utf-8-sig")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConversionError(
+                f"invalid context evidence file: {context_file}"
+            ) from exc
     if mirror_spec:
         expected_account = str(mirror_spec.get("account_id") or "")
         expected_region = str(mirror_spec.get("region") or "")
@@ -268,15 +278,8 @@ def convert(
 
         requests = core.context_plan(scenario, nodes, edges, mirror_spec)
         context_evidence = None
-        if context_file:
-            try:
-                context_evidence = json.loads(
-                    context_file.read_text(encoding="utf-8-sig")
-                )
-            except (OSError, json.JSONDecodeError) as exc:
-                raise ConversionError(
-                    f"invalid context evidence file: {context_file}"
-                ) from exc
+        if preloaded_context is not None:
+            context_evidence = preloaded_context
             context_account = str(
                 context_evidence.get("identity", {}).get("Account") or ""
             )
