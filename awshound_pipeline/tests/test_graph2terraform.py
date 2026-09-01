@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -88,6 +89,51 @@ class Graph2TerraformTests(unittest.TestCase):
             self.assertEqual(
                 result["generated"][0]["scenario_type"], "integrated_rnr_path"
             )
+
+    def test_load_and_convert_mirror_package(self):
+        fixture = ROOT / "fixtures" / "synthetic-integrated-rnr-path.json"
+        document = json.loads(fixture.read_text(encoding="utf-8"))
+        node_ids = [value["id"] for value in document["graph"]["nodes"]]
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "package"
+            package.mkdir()
+            graph_zip = package / "test-evidence-graph.zip"
+            with zipfile.ZipFile(graph_zip, "w") as archive:
+                archive.writestr("graph.json", json.dumps(document))
+            spec = {
+                "schema_version": "1.0",
+                "scenario_id": "test-integrated-package",
+                "account_id": "111122223333",
+                "region": "ap-northeast-2",
+                "graph_node_ids": node_ids,
+                "selected_runtime_path": {"frontend_task_id": "a" * 32},
+                "steps": [{"step": 1, "title": "test"}],
+            }
+            (package / "test-mirror-spec.json").write_text(
+                json.dumps(spec), encoding="utf-8"
+            )
+            input_path, loaded_spec, raw = MODULE.load_mirror_package(package)
+            output = Path(temporary) / "generated"
+            result = MODULE.convert(
+                input_path,
+                output,
+                None,
+                False,
+                None,
+                loaded_spec,
+                str(package),
+                raw,
+            )
+            self.assertEqual(result["generated_count"], 1)
+            self.assertEqual(
+                result["generated"][0]["scenario_id"], "test-integrated-package"
+            )
+            destination = Path(result["generated"][0]["directory"])
+            self.assertTrue((destination / "source-mirror-spec.json").is_file())
+            coverage = json.loads(
+                (destination / "terraform-coverage.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(coverage["validation_steps"]), 1)
 
 
 if __name__ == "__main__":

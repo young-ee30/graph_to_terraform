@@ -10,6 +10,18 @@ API를 계획한다. AppEndpoint의 경로·포트만으로는 실행 주체와 
 `workload_id/workload_arn`과 `artifact_uri/image_digest`가 없으면 Coverage Gate가
 Terraform Apply를 차단한다.
 
+#### 통합 Package 입력
+
+`--input-package`는 Evidence Graph와 Mirror Spec을 함께 검증한다. 특정 20단계 이름에
+의존하지 않으며 Node Kind·ARN/ID·Edge와 선택된 Runtime Hint를 출발점으로
+ECS·ECR·ELB·EC2·RDS·Secrets Manager의 읽기 API를 재귀 호출하며,
+수집 결과는 `context-evidence.json`과 비밀값이 제거된 `context-inventory.json`으로
+분리한다. 네트워크·ECS·ALB·WAF는 Context가 충족되면 Terraform으로 렌더링한다.
+
+RDS 데이터 평면, 실제 Secret, 이미지 Layer와 AMI/EBS 내용은 제어 API 조회만으로
+복원되지 않는다. 승인된 합성 Snapshot/Seed, Secret Contract, Target Account에서 접근
+가능한 Image Digest가 없으면 Coverage Gate를 유지한다.
+
 AWSHound OpenGraph `graph.json` 또는 ZIP을 Terraform 소스 파일로만 변환하는 단독 CLI다.
 
 기본 Offline 모드는 AWS API에 연결하지 않는다. `--source-profile`을 지정하면 관련

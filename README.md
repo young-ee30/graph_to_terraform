@@ -72,6 +72,37 @@ Profile Account ID가 Graph의 Source Account ID와 다르면 중단합니다. �
 Profile을 지정하지 않아도 `context-plan.json`에는 해당 경로에 필요한 읽기 API 목록이
 생성됩니다. 실제 API 호출은 `--source-profile`을 지정했을 때만 수행됩니다.
 
+통합 Mirror Package를 직접 입력하는 경우(20단계 패키지는 검증 예시):
+
+```powershell
+py ".\awshound_pipeline\graph2terraform.py" `
+  --input-package "C:\path\mirror-package" `
+  --source-profile source-readonly `
+  --output ".\generated-mirror"
+```
+
+Package에는 정확히 다음 두 파일이 필요합니다.
+
+- `*-evidence-graph.zip`
+- `*-mirror-spec.json`
+
+도구는 특정 시나리오 이름이 아니라 Node Kind, ARN/ID, Edge, Mirror Spec의 Runtime
+Hint를 기준으로 API를 선택합니다. Mirror Spec의 Account·Region·Node ID를 Graph와
+대조한 뒤 다음 순서로 읽기 Context를 확장합니다.
+
+```text
+Selected ECS Task ID
+→ ECS Cluster·Service
+→ Task Definition
+→ ECR Image Digest
+→ EC2·ENI·VPC·Subnet·SG
+→ ALB·Listener·Target Group·WAF
+→ RDS·Snapshot·Secret metadata
+```
+
+수집기 권한 예시는 `iam/mirror-context-collector-policy.json`에 있습니다. 수집기는
+`GetSecretValue`와 모든 Create·Update·Delete 작업을 코드에서 거부합니다.
+
 #### 생성 결과
 
 ```text
@@ -84,6 +115,9 @@ generated-terraform/
    ├─ terraform.tfvars.example
    ├─ required-inputs.json
    ├─ context-plan.json
+   ├─ context-evidence.json       # --source-profile 사용 시
+   ├─ context-inventory.json      # Secret 값이 제거된 요약
+   ├─ source-mirror-spec.json     # Package 입력 시
    ├─ terraform-coverage.json
    ├─ conversion-manifest.json
    └─ fixtures/
@@ -141,6 +175,15 @@ Terraform을 만들려면 각 AppEndpoint에 다음 정보가 추가되어야 �
 
 해당 정보가 없으면 도구는 추측하지 않고 `terraform-coverage.json`과
 `required-inputs.json`에 `APP_WORKLOAD_BINDING_REQUIRED`를 남겨 Apply를 차단합니다.
+
+Package와 읽기 Context가 있으면 ECS Cluster·Task Definition·Service, ALB·Target Group,
+HTTP Listener, 허용 CIDR 기반 WAF, VPC·Subnet·SG·Route·NACL을 Terraform으로 생성합니다.
+HTTPS 인증서, Task Secret 값, Volume, 교차 계정 ECR/AMI, RDS Schema·Canary Row는
+자동 복사하지 않으며 Coverage Gate와 `required-inputs.json`에 남깁니다.
+
+현재 자동 API 규칙은 공식 `AWS_*`와 등록된 `RNR_*` Node Kind에 적용됩니다. 새로운
+Custom Node Kind가 들어오면 임의 추측하지 않고 `UNKNOWN_NODE`로 차단하며, 해당 Kind의
+API·Terraform Adapter를 Registry에 추가해야 합니다.
 
 #### 테스트
 

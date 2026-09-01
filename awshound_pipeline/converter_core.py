@@ -44,7 +44,7 @@ from pathlib import Path
 
 from typing import Any, Iterable
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 class PipelineError(RuntimeError):
     """Raised for invalid input, unsafe execution, or unsupported paths."""
@@ -107,6 +107,7 @@ class ContextRequest:
     required: bool
     region: str | None = None
     mutating: bool = False
+    hints: dict[str, Any] = field(default_factory=dict)
 
 NODE_LAYERS: dict[str, str] = {
     "AWS_Organization": "L1_IAM_CONTROL_PLANE",
@@ -1042,9 +1043,13 @@ def add_context_request(
     reason: str,
     required: bool = True,
     region: str | None = None,
+    hints: dict[str, Any] | None = None,
 ) -> None:
+    request_hints = hints or {}
     fingerprint = hashlib.sha1(
-        json.dumps([service, operation, arguments, region], sort_keys=True).encode("utf-8")
+        json.dumps(
+            [service, operation, arguments, region, request_hints], sort_keys=True
+        ).encode("utf-8")
     ).hexdigest()[:10]
     requests.append(
         ContextRequest(
@@ -1055,6 +1060,7 @@ def add_context_request(
             reason=reason,
             required=required,
             region=region,
+            hints=request_hints,
         )
     )
 
@@ -1063,10 +1069,12 @@ def node_context_requests(node: Node, default_region: str) -> list[ContextReques
     kind = node.primary_kind
     name = node_name(node)
     region = node_region(node) or default_region
-    if kind == "RNR_LoadBalancer":
+    if kind in {"RNR_LoadBalancer", "AWS_LoadBalancer"}:
         load_balancer_arn = node.arn
         if load_balancer_arn:
             add_context_request(requests, service="elbv2", operation="describe-load-balancers", arguments=["--load-balancer-arns", load_balancer_arn], reason="Confirm ALB scheme, type, VPC, subnets and security groups.", region=region)
+            add_context_request(requests, service="elbv2", operation="describe-load-balancer-attributes", arguments=["--load-balancer-arn", load_balancer_arn], reason="Confirm ALB access logs, deletion protection, routing and security attributes.", region=region)
+            add_context_request(requests, service="elbv2", operation="describe-tags", arguments=["--resource-arns", load_balancer_arn], reason="Collect ALB tags used for deterministic workload matching.", required=False, region=region)
             add_context_request(requests, service="elbv2", operation="describe-listeners", arguments=["--load-balancer-arn", load_balancer_arn], reason="Confirm listener protocols, ports and default actions.", region=region)
             add_context_request(requests, service="elbv2", operation="describe-target-groups", arguments=["--load-balancer-arn", load_balancer_arn], reason="Confirm target-group protocol, health check, target type and VPC.", region=region)
     elif kind == "RNR_WAFWebACL":
@@ -1093,6 +1101,55 @@ def node_context_requests(node: Node, default_region: str) -> list[ContextReques
         acl_id = str(node.properties.get("acl_id") or "")
         if acl_id:
             add_context_request(requests, service="ec2", operation="describe-network-acls", arguments=["--network-acl-ids", acl_id], reason="Confirm RNR network ACL entries, VPC and subnet associations.", region=region)
+    elif kind == "RNR_AppEndpoint":
+        workload_arn = str(node.properties.get("workload_arn") or "")
+        if ":ecs:" in workload_arn and ":service/" in workload_arn:
+            resource = workload_arn.split(":service/", 1)[-1]
+            cluster = resource.split("/", 1)[0]
+            add_context_request(requests, service="ecs", operation="describe-services", arguments=["--cluster", cluster, "--services", workload_arn, "--include", "TAGS"], reason="Resolve the endpoint's explicit ECS service binding.", region=region)
+        elif ":lambda:" in workload_arn and ":function:" in workload_arn:
+            add_context_request(requests, service="lambda", operation="get-function", arguments=["--function-name", workload_arn], reason="Resolve the endpoint's explicit Lambda binding.", region=region)
+    elif kind == "AWS_ECSCluster":
+        cluster = node.arn or name
+        add_context_request(requests, service="ecs", operation="describe-clusters", arguments=["--clusters", cluster, "--include", "SETTINGS", "STATISTICS", "CONFIGURATIONS", "ATTACHMENTS"], reason="Confirm ECS cluster configuration.", region=region)
+        add_context_request(requests, service="ecs", operation="list-services", arguments=["--cluster", cluster], reason="Enumerate services attached to the selected ECS cluster.", region=region)
+        add_context_request(requests, service="ecs", operation="list-container-instances", arguments=["--cluster", cluster], reason="Enumerate EC2 container instances attached to the selected ECS cluster.", required=False, region=region)
+    elif kind == "AWS_ECSService":
+        service_arn = node.arn or name
+        cluster = str(node.properties.get("cluster_arn") or node.properties.get("cluster_name") or "")
+        if not cluster and ":service/" in service_arn:
+            cluster = service_arn.split(":service/", 1)[-1].split("/", 1)[0]
+        if cluster:
+            add_context_request(requests, service="ecs", operation="describe-services", arguments=["--cluster", cluster, "--services", service_arn, "--include", "TAGS"], reason="Confirm ECS service task definition, deployment and network bindings.", region=region)
+    elif kind == "AWS_ECSTask":
+        task = node.arn or str(node.properties.get("task_id") or name)
+        cluster = str(node.properties.get("cluster_arn") or node.properties.get("cluster_name") or "")
+        if cluster:
+            add_context_request(requests, service="ecs", operation="describe-tasks", arguments=["--cluster", cluster, "--tasks", task, "--include", "TAGS"], reason="Confirm ECS task definition, role and ENI bindings.", region=region)
+    elif kind == "AWS_VPC":
+        vpc_id = str(node.properties.get("vpc_id") or name)
+        add_context_request(requests, service="ec2", operation="describe-vpcs", arguments=["--vpc-ids", vpc_id], reason="Confirm selected VPC configuration.", region=region)
+    elif kind == "AWS_Subnet":
+        subnet_id = str(node.properties.get("subnet_id") or name)
+        add_context_request(requests, service="ec2", operation="describe-subnets", arguments=["--subnet-ids", subnet_id], reason="Confirm selected subnet configuration.", region=region)
+        add_context_request(requests, service="ec2", operation="describe-route-tables", arguments=["--filters", f"Name=association.subnet-id,Values={subnet_id}"], reason="Confirm selected subnet routes.", region=region)
+        add_context_request(requests, service="ec2", operation="describe-network-acls", arguments=["--filters", f"Name=association.subnet-id,Values={subnet_id}"], reason="Confirm selected subnet NACL.", region=region)
+    elif kind == "AWS_SecurityGroup":
+        group_id = str(node.properties.get("group_id") or name)
+        add_context_request(requests, service="ec2", operation="describe-security-groups", arguments=["--group-ids", group_id], reason="Confirm selected security-group metadata.", region=region)
+        add_context_request(requests, service="ec2", operation="describe-security-group-rules", arguments=["--filters", f"Name=group-id,Values={group_id}"], reason="Confirm selected security-group rules.", region=region)
+    elif kind == "AWS_VPCEndpoint":
+        endpoint_id = str(node.properties.get("vpc_endpoint_id") or node.properties.get("endpoint_id") or name)
+        add_context_request(requests, service="ec2", operation="describe-vpc-endpoints", arguments=["--vpc-endpoint-ids", endpoint_id], reason="Confirm selected VPC endpoint service, subnets, policy and route bindings.", region=region)
+    elif kind == "AWS_Database":
+        database_arn = node.arn or ""
+        if ":rds:" in database_arn and ":db:" in database_arn:
+            identifier = database_arn.split(":db:", 1)[-1]
+            add_context_request(requests, service="rds", operation="describe-db-instances", arguments=["--db-instance-identifier", identifier], reason="Confirm selected RDS instance configuration.", region=region)
+    elif kind == "AWS_Secret":
+        secret_id = node.arn or name
+        add_context_request(requests, service="secretsmanager", operation="describe-secret", arguments=["--secret-id", secret_id], reason="Collect selected secret metadata only.", region=region)
+        add_context_request(requests, service="secretsmanager", operation="get-resource-policy", arguments=["--secret-id", secret_id], reason="Collect selected secret resource policy without its value.", required=False, region=region)
     elif kind == "AWS_User":
         add_context_request(requests, service="iam", operation="get-user", arguments=["--user-name", name], reason="Confirm user state and permissions boundary.")
         add_context_request(requests, service="iam", operation="list-user-policies", arguments=["--user-name", name], reason="Enumerate inline policy names.")
@@ -1235,12 +1292,117 @@ def node_context_requests(node: Node, default_region: str) -> list[ContextReques
         )
     return requests
 
+def mirror_spec_context_requests(
+    scenario: Scenario,
+    nodes: dict[str, Node],
+    mirror_spec: dict[str, Any] | None,
+) -> list[ContextRequest]:
+    workload_kinds = {
+        "AWS_ECSCluster",
+        "AWS_ECSService",
+        "AWS_ECSTask",
+        "RNR_AppEndpoint",
+    }
+    if not any(node.primary_kind in workload_kinds for node in nodes.values()):
+        return []
+    requests: list[ContextRequest] = []
+    spec = mirror_spec or {}
+    runtime = spec.get("selected_runtime_path", {})
+    runtime = runtime if isinstance(runtime, dict) else {}
+    task_ids = sorted(
+        {
+            str(value)
+            for key, value in runtime.items()
+            if str(key).endswith("_task_id") and value
+        }
+    )
+    service_names = sorted(
+        ({
+            str(key).removesuffix("_task_id")
+            for key, value in runtime.items()
+            if str(key).endswith("_task_id") and value
+        }
+        | {
+            str(node.properties.get("service"))
+            for node in nodes.values()
+            if node.primary_kind == "RNR_AppEndpoint"
+            and node.properties.get("service")
+            and str(node.properties.get("service")).lower() != "result"
+        })
+    )
+    instance_ids = sorted(
+        ({
+            str(value)
+            for key, value in runtime.items()
+            if str(key).endswith("_instance_id") and value
+        }
+        | {
+            str(node.properties.get("instance_id"))
+            for node in nodes.values()
+            if node.primary_kind == "AWS_EC2Instance"
+            and node.properties.get("instance_id")
+        })
+    )
+    project = next(
+        (
+            str(node.properties.get("project"))
+            for node in nodes.values()
+            if node.primary_kind == "RNR_Environment"
+            and node.properties.get("project")
+        ),
+        str(spec.get("project") or ""),
+    )
+    add_context_request(
+        requests,
+        service="ecs",
+        operation="list-clusters",
+        arguments=[],
+        reason="Discover the ECS cluster containing the selected runtime task IDs.",
+        region=scenario.region,
+        hints={"task_ids": task_ids, "service_names": service_names},
+    )
+    if project:
+        add_context_request(
+            requests,
+            service="resourcegroupstaggingapi",
+            operation="get-resources",
+            arguments=[
+                "--tag-filters",
+                f"Key=Project,Values={project}",
+                "--resource-type-filters",
+                "ecs:service",
+                "rds:db",
+                "secretsmanager:secret",
+                "ecr:repository",
+            ],
+            reason="Discover only resources carrying the graph's project tag.",
+            required=False,
+            region=scenario.region,
+            hints={"project": project},
+        )
+    if instance_ids:
+        add_context_request(
+            requests,
+            service="autoscaling",
+            operation="describe-auto-scaling-instances",
+            arguments=["--instance-ids", *instance_ids],
+            reason="Confirm whether the selected ECS node is managed by an Auto Scaling group.",
+            required=False,
+            region=scenario.region,
+        )
+    return requests
+
+
 def context_plan(
-    scenario: Scenario, nodes: dict[str, Node], edges: list[Edge]
+    scenario: Scenario,
+    nodes: dict[str, Node],
+    edges: list[Edge],
+    mirror_spec: dict[str, Any] | None = None,
 ) -> list[ContextRequest]:
     requests: list[ContextRequest] = []
     for node_id in scenario.node_ids:
         requests.extend(node_context_requests(nodes[node_id], scenario.region))
+    requests.extend(mirror_spec_context_requests(scenario, nodes, mirror_spec))
 
     # Simulate each meaningful edge when the source is an IAM user or role and
     # the graph exposes usable ARNs.  This remains non-mutating.
@@ -1293,6 +1455,22 @@ def context_plan(
     return sorted(unique.values(), key=lambda item: item.request_id)
 
 def aws_cli_command(request: ContextRequest, profile: str) -> list[str]:
+    read_only_prefixes = (
+        "get-",
+        "list-",
+        "describe-",
+        "head-",
+        "simulate-",
+        "validate-",
+        "batch-get-",
+    )
+    if request.mutating or not request.operation.startswith(read_only_prefixes):
+        raise PipelineError(
+            f"context collector rejected a non-read-only operation: "
+            f"{request.service}:{request.operation}"
+        )
+    if request.service == "secretsmanager" and request.operation == "get-secret-value":
+        raise PipelineError("context collector never retrieves secret values")
     command = ["aws", request.service, request.operation, *request.arguments]
     if request.region:
         command.extend(["--region", request.region])
@@ -1350,17 +1528,320 @@ def discovered_network_requests(
         add_context_request(requests, service="ec2", operation="describe-security-group-rules", arguments=["--filters", "Name=group-id,Values=" + ",".join(groups)], reason=f"{reason_prefix}: confirm security-group rules.", region=region)
     return requests
 
+
+def request_argument(request: ContextRequest, flag: str) -> str | None:
+    try:
+        return request.arguments[request.arguments.index(flag) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def chunks(values: list[str], size: int) -> Iterable[list[str]]:
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def ecr_image_reference(value: str) -> dict[str, str] | None:
+    match = re.match(
+        r"^(?P<registry>\d{12})\.dkr\.ecr\.(?P<region>[^.]+)\.amazonaws\.com/"
+        r"(?P<repository>[^@:]+(?:/[^@:]+)*)(?:(?::(?P<tag>[^@]+))|(?:@(?P<digest>sha256:[0-9a-fA-F]+)))?$",
+        value,
+    )
+    return match.groupdict() if match else None
+
+
+def nested_values(value: Any, key: str) -> Iterable[Any]:
+    if isinstance(value, dict):
+        for current_key, current_value in value.items():
+            if current_key == key:
+                yield current_value
+            yield from nested_values(current_value, key)
+    elif isinstance(value, list):
+        for item in value:
+            yield from nested_values(item, key)
+
 def expand_context_response(
     request: ContextRequest, response: dict[str, Any]
 ) -> list[ContextRequest]:
     region = request.region or "us-east-1"
+    if request.service == "ecs" and request.operation == "list-clusters":
+        requests: list[ContextRequest] = []
+        task_ids = [str(value) for value in request.hints.get("task_ids", [])]
+        service_names = [
+            str(value) for value in request.hints.get("service_names", [])
+        ]
+        for cluster_arn in response.get("clusterArns", []):
+            cluster = str(cluster_arn)
+            add_context_request(
+                requests,
+                service="ecs",
+                operation="describe-clusters",
+                arguments=["--clusters", cluster, "--include", "SETTINGS", "STATISTICS", "CONFIGURATIONS", "ATTACHMENTS"],
+                reason="Confirm ECS cluster settings and capacity providers.",
+                region=region,
+            )
+            if task_ids:
+                add_context_request(
+                    requests,
+                    service="ecs",
+                    operation="describe-tasks",
+                    arguments=["--cluster", cluster, "--tasks", *task_ids, "--include", "TAGS"],
+                    reason="Locate selected mirror-spec tasks in this ECS cluster.",
+                    required=False,
+                    region=region,
+                    hints={"service_names": service_names},
+                )
+            add_context_request(
+                requests,
+                service="ecs",
+                operation="list-services",
+                arguments=["--cluster", cluster],
+                reason="Enumerate ECS services so endpoint service names can be bound to workloads.",
+                required=False,
+                region=region,
+                hints={"service_names": service_names},
+            )
+            add_context_request(
+                requests,
+                service="ecs",
+                operation="list-container-instances",
+                arguments=["--cluster", cluster],
+                reason="Enumerate ECS container instances for the selected EC2 launch-type node.",
+                required=False,
+                region=region,
+            )
+        return requests
+    if request.service == "ecs" and request.operation == "list-services":
+        requests = []
+        cluster = request_argument(request, "--cluster") or ""
+        wanted = {
+            value.lower() for value in request.hints.get("service_names", [])
+        }
+        service_arns = [str(value) for value in response.get("serviceArns", [])]
+        preferred = [
+            arn
+            for arn in service_arns
+            if not wanted
+            or any(name in arn.rsplit("/", 1)[-1].lower() for name in wanted)
+        ]
+        for batch in chunks(preferred or service_arns, 10):
+            add_context_request(
+                requests,
+                service="ecs",
+                operation="describe-services",
+                arguments=["--cluster", cluster, "--services", *batch, "--include", "TAGS"],
+                reason="Resolve ECS services to task definitions, target groups and network configuration.",
+                required=False,
+                region=region,
+            )
+        return requests
+    if request.service == "ecs" and request.operation == "list-container-instances":
+        arns = [str(value) for value in response.get("containerInstanceArns", [])]
+        if not arns:
+            return []
+        return [
+            ContextRequest(
+                request_id="ctx-" + hashlib.sha1(("ecs-container-instances" + "\n".join(arns)).encode()).hexdigest()[:10],
+                service="ecs",
+                operation="describe-container-instances",
+                arguments=["--cluster", request_argument(request, "--cluster") or "", "--container-instances", *arns, "--include", "TAGS", "CONTAINER_INSTANCE_HEALTH"],
+                reason="Resolve ECS container instances to EC2 instance IDs.",
+                required=False,
+                region=region,
+            )
+        ]
+    if request.service == "ecs" and request.operation == "describe-container-instances":
+        requests = []
+        instance_ids = sorted(
+            {
+                str(value.get("ec2InstanceId"))
+                for value in response.get("containerInstances", [])
+                if value.get("ec2InstanceId")
+            }
+        )
+        if instance_ids:
+            add_context_request(requests, service="ec2", operation="describe-instances", arguments=["--instance-ids", *instance_ids], reason="Collect EC2 configuration for ECS container instances.", region=region)
+        return requests
+    if request.service == "ecs" and request.operation == "describe-tasks":
+        requests = []
+        cluster = request_argument(request, "--cluster") or ""
+        task_definitions = sorted(
+            {
+                str(task.get("taskDefinitionArn"))
+                for task in response.get("tasks", [])
+                if task.get("taskDefinitionArn")
+            }
+        )
+        for task_definition in task_definitions:
+            add_context_request(requests, service="ecs", operation="describe-task-definition", arguments=["--task-definition", task_definition, "--include", "TAGS"], reason="Collect the selected task's container image, ports, roles, volumes and runtime settings.", region=region)
+        container_instances = sorted(
+            {
+                str(task.get("containerInstanceArn"))
+                for task in response.get("tasks", [])
+                if task.get("containerInstanceArn")
+            }
+        )
+        if container_instances:
+            add_context_request(requests, service="ecs", operation="describe-container-instances", arguments=["--cluster", cluster, "--container-instances", *container_instances, "--include", "TAGS", "CONTAINER_INSTANCE_HEALTH"], reason="Resolve selected tasks to their EC2 container instances.", region=region)
+        eni_ids = sorted(
+            {
+                str(detail.get("value"))
+                for task in response.get("tasks", [])
+                for attachment in task.get("attachments", [])
+                for detail in attachment.get("details", [])
+                if detail.get("name") == "networkInterfaceId" and detail.get("value")
+            }
+        )
+        if eni_ids:
+            add_context_request(requests, service="ec2", operation="describe-network-interfaces", arguments=["--network-interface-ids", *eni_ids], reason="Collect task ENI subnet, IP and security-group bindings.", region=region)
+        return requests
+    if request.service == "ecs" and request.operation == "describe-services":
+        requests = []
+        for service in response.get("services", []):
+            task_definition = str(service.get("taskDefinition") or "")
+            if task_definition:
+                add_context_request(requests, service="ecs", operation="describe-task-definition", arguments=["--task-definition", task_definition, "--include", "TAGS"], reason="Collect ECS service task-definition runtime settings.", region=region)
+            for binding in service.get("loadBalancers", []):
+                target_group = str(binding.get("targetGroupArn") or "")
+                if target_group:
+                    add_context_request(requests, service="elbv2", operation="describe-target-groups", arguments=["--target-group-arns", target_group], reason="Collect ECS service target-group configuration.", region=region)
+                    add_context_request(requests, service="elbv2", operation="describe-target-health", arguments=["--target-group-arn", target_group], reason="Confirm ECS service target registration and health.", region=region)
+            network = service.get("networkConfiguration", {}).get("awsvpcConfiguration", {})
+            requests.extend(
+                discovered_network_requests(
+                    vpc_ids=[],
+                    subnet_ids=[str(value) for value in network.get("subnets", [])],
+                    security_group_ids=[str(value) for value in network.get("securityGroups", [])],
+                    region=region,
+                    reason_prefix="ECS service dependency expansion",
+                )
+            )
+        return requests
+    if request.service == "ecs" and request.operation == "describe-task-definition":
+        requests = []
+        task_definition = response.get("taskDefinition", {})
+        for container in task_definition.get("containerDefinitions", []):
+            image = str(container.get("image") or "")
+            parsed = ecr_image_reference(image)
+            if parsed:
+                image_selector = (
+                    f"imageDigest={parsed['digest']}"
+                    if parsed.get("digest")
+                    else f"imageTag={parsed.get('tag') or 'latest'}"
+                )
+                common = [
+                    "--registry-id", parsed["registry"],
+                    "--repository-name", parsed["repository"],
+                    "--image-ids", image_selector,
+                ]
+                add_context_request(requests, service="ecr", operation="describe-images", arguments=common, reason="Resolve the task image tag to an immutable digest.", region=parsed["region"])
+                add_context_request(requests, service="ecr", operation="batch-get-image", arguments=common, reason="Collect the OCI image manifest without copying image layers.", region=parsed["region"])
+            for secret in container.get("secrets", []):
+                value_from = str(secret.get("valueFrom") or "")
+                if ":secretsmanager:" in value_from:
+                    add_context_request(requests, service="secretsmanager", operation="describe-secret", arguments=["--secret-id", value_from], reason="Collect secret metadata only; never retrieve its value.", required=False, region=region)
+                    add_context_request(requests, service="secretsmanager", operation="get-resource-policy", arguments=["--secret-id", value_from], reason="Collect the secret resource policy without retrieving its value.", required=False, region=region)
+                elif ":ssm:" in value_from:
+                    parameter_name = value_from.split(":parameter", 1)[-1]
+                    add_context_request(requests, service="ssm", operation="describe-parameters", arguments=["--parameter-filters", f"Key=Name,Option=Equals,Values={parameter_name}"], reason="Collect injected SSM parameter metadata only.", required=False, region=region)
+        for role_key in ("taskRoleArn", "executionRoleArn"):
+            role_arn = str(task_definition.get(role_key) or "")
+            if role_arn:
+                add_context_request(requests, service="iam", operation="get-role", arguments=["--role-name", role_arn.rsplit("/", 1)[-1]], reason=f"Confirm ECS {role_key} trust and metadata.")
+        return requests
+    if (
+        request.service == "resourcegroupstaggingapi"
+        and request.operation == "get-resources"
+    ):
+        requests = []
+        for mapping in response.get("ResourceTagMappingList", []):
+            arn = str(mapping.get("ResourceARN") or "")
+            if ":ecs:" in arn and ":service/" in arn:
+                resource = arn.split(":service/", 1)[-1]
+                cluster = resource.split("/", 1)[0]
+                add_context_request(requests, service="ecs", operation="describe-services", arguments=["--cluster", cluster, "--services", arn, "--include", "TAGS"], reason="Collect the project-tagged ECS service configuration.", required=False, region=region)
+            elif ":rds:" in arn and ":db:" in arn:
+                identifier = arn.split(":db:", 1)[-1]
+                add_context_request(requests, service="rds", operation="describe-db-instances", arguments=["--db-instance-identifier", identifier], reason="Collect the project-tagged RDS instance configuration.", required=False, region=region)
+            elif ":secretsmanager:" in arn and ":secret:" in arn:
+                add_context_request(requests, service="secretsmanager", operation="describe-secret", arguments=["--secret-id", arn], reason="Collect project-tagged secret metadata only.", required=False, region=region)
+                add_context_request(requests, service="secretsmanager", operation="get-resource-policy", arguments=["--secret-id", arn], reason="Collect project-tagged secret policy without retrieving its value.", required=False, region=region)
+            elif ":ecr:" in arn and ":repository/" in arn:
+                repository = arn.split(":repository/", 1)[-1]
+                add_context_request(requests, service="ecr", operation="describe-repositories", arguments=["--repository-names", repository], reason="Collect project-tagged ECR repository settings and policy dependencies.", required=False, region=region)
+                add_context_request(requests, service="ecr", operation="get-repository-policy", arguments=["--repository-name", repository], reason="Confirm whether a mirror account can pull the source image.", required=False, region=region)
+        return requests
+    if request.service == "rds" and request.operation == "describe-db-instances":
+        requests = []
+        for instance in response.get("DBInstances", []):
+            identifier = str(instance.get("DBInstanceIdentifier") or "")
+            subnet_group = instance.get("DBSubnetGroup", {}) or {}
+            subnet_group_name = str(subnet_group.get("DBSubnetGroupName") or "")
+            if subnet_group_name:
+                add_context_request(requests, service="rds", operation="describe-db-subnet-groups", arguments=["--db-subnet-group-name", subnet_group_name], reason="Collect RDS subnet-group VPC and subnet membership.", region=region)
+            for parameter_group in instance.get("DBParameterGroups", []):
+                name = str(parameter_group.get("DBParameterGroupName") or "")
+                if name:
+                    add_context_request(requests, service="rds", operation="describe-db-parameters", arguments=["--db-parameter-group-name", name], reason="Collect effective RDS parameter-group settings.", required=False, region=region)
+            if identifier:
+                add_context_request(requests, service="rds", operation="describe-db-snapshots", arguments=["--db-instance-identifier", identifier, "--snapshot-type", "manual"], reason="Discover approved manual snapshots for functional mirror restoration.", required=False, region=region)
+                add_context_request(requests, service="rds", operation="list-tags-for-resource", arguments=["--resource-name", str(instance.get("DBInstanceArn") or "")], reason="Confirm RDS data-classification and project tags.", required=False, region=region)
+            requests.extend(
+                discovered_network_requests(
+                    vpc_ids=[str(subnet_group.get("VpcId") or "")],
+                    subnet_ids=[
+                        str(value.get("SubnetIdentifier") or "")
+                        for value in subnet_group.get("Subnets", [])
+                    ],
+                    security_group_ids=[
+                        str(value.get("VpcSecurityGroupId") or "")
+                        for value in instance.get("VpcSecurityGroups", [])
+                    ],
+                    region=region,
+                    reason_prefix="RDS dependency expansion",
+                )
+            )
+            kms_key_id = str(instance.get("KmsKeyId") or "")
+            if kms_key_id:
+                add_context_request(requests, service="kms", operation="describe-key", arguments=["--key-id", kms_key_id], reason="Collect RDS encryption-key metadata; key material is never copied.", required=False, region=region)
+            secret_arn = str((instance.get("MasterUserSecret") or {}).get("SecretArn") or "")
+            if secret_arn:
+                add_context_request(requests, service="secretsmanager", operation="describe-secret", arguments=["--secret-id", secret_arn], reason="Collect RDS managed-secret metadata only.", required=False, region=region)
+        return requests
+    if request.service == "secretsmanager" and request.operation == "describe-secret":
+        requests = []
+        kms_key_id = str(response.get("KmsKeyId") or "")
+        if kms_key_id:
+            add_context_request(requests, service="kms", operation="describe-key", arguments=["--key-id", kms_key_id], reason="Collect secret KMS-key metadata; key material is never copied.", required=False, region=region)
+        return requests
+    if request.service == "autoscaling" and request.operation == "describe-auto-scaling-instances":
+        requests = []
+        groups = sorted(
+            {
+                str(value.get("AutoScalingGroupName"))
+                for value in response.get("AutoScalingInstances", [])
+                if value.get("AutoScalingGroupName")
+            }
+        )
+        if groups:
+            add_context_request(requests, service="autoscaling", operation="describe-auto-scaling-groups", arguments=["--auto-scaling-group-names", *groups], reason="Collect ECS node Auto Scaling capacity and launch-template bindings.", required=False, region=region)
+        return requests
+    if request.service == "autoscaling" and request.operation == "describe-auto-scaling-groups":
+        requests = []
+        for group in response.get("AutoScalingGroups", []):
+            template = group.get("LaunchTemplate") or {}
+            template_id = str(template.get("LaunchTemplateId") or "")
+            version = str(template.get("Version") or "$Default")
+            if template_id:
+                add_context_request(requests, service="ec2", operation="describe-launch-template-versions", arguments=["--launch-template-id", template_id, "--versions", version], reason="Collect the ECS node launch-template AMI, instance profile, user data and network settings.", region=region)
+        return requests
     if request.service == "ec2" and request.operation == "describe-instances":
         instances = [
             instance
             for reservation in response.get("Reservations", [])
             for instance in reservation.get("Instances", [])
         ]
-        return discovered_network_requests(
+        requests = discovered_network_requests(
             vpc_ids=[str(item.get("VpcId", "")) for item in instances],
             subnet_ids=[str(item.get("SubnetId", "")) for item in instances],
             security_group_ids=[
@@ -1370,6 +1851,45 @@ def expand_context_response(
             ],
             region=region,
             reason_prefix="EC2 dependency expansion",
+        )
+        volume_ids = sorted(
+            {
+                str(mapping.get("Ebs", {}).get("VolumeId"))
+                for item in instances
+                for mapping in item.get("BlockDeviceMappings", [])
+                if mapping.get("Ebs", {}).get("VolumeId")
+            }
+        )
+        if volume_ids:
+            add_context_request(requests, service="ec2", operation="describe-volumes", arguments=["--volume-ids", *volume_ids], reason="Collect EBS type, size, encryption and snapshot lineage.", region=region)
+        for item in instances:
+            template = item.get("LaunchTemplate") or {}
+            template_id = str(template.get("LaunchTemplateId") or "")
+            version = str(template.get("Version") or "$Default")
+            if template_id:
+                add_context_request(requests, service="ec2", operation="describe-launch-template-versions", arguments=["--launch-template-id", template_id, "--versions", version], reason="Collect launch-template settings for the selected ECS node.", required=False, region=region)
+        return requests
+    if request.service == "ec2" and request.operation == "describe-network-interfaces":
+        interfaces = response.get("NetworkInterfaces", [])
+        return discovered_network_requests(
+            vpc_ids=[str(item.get("VpcId", "")) for item in interfaces],
+            subnet_ids=[str(item.get("SubnetId", "")) for item in interfaces],
+            security_group_ids=[
+                str(group.get("GroupId", ""))
+                for item in interfaces
+                for group in item.get("Groups", [])
+            ],
+            region=region,
+            reason_prefix="ENI dependency expansion",
+        )
+    if request.service == "ec2" and request.operation == "describe-security-groups":
+        groups = response.get("SecurityGroups", [])
+        return discovered_network_requests(
+            vpc_ids=[str(item.get("VpcId", "")) for item in groups],
+            subnet_ids=[],
+            security_group_ids=[],
+            region=region,
+            reason_prefix="Security-group dependency expansion",
         )
     if request.service == "elbv2" and request.operation == "describe-load-balancers":
         load_balancers = response.get("LoadBalancers", [])
@@ -1415,6 +1935,43 @@ def expand_context_response(
                     reason="Confirm target identities, ports and health state.",
                     region=region,
                 )
+                add_context_request(
+                    requests,
+                    service="elbv2",
+                    operation="describe-target-group-attributes",
+                    arguments=["--target-group-arn", target_group_arn],
+                    reason="Collect target-group routing, deregistration and stickiness attributes.",
+                    required=False,
+                    region=region,
+                )
+        return requests
+    if request.service == "elbv2" and request.operation == "describe-target-health":
+        requests = []
+        instance_ids: list[str] = []
+        private_ips: list[str] = []
+        for value in response.get("TargetHealthDescriptions", []):
+            target_id = str((value.get("Target") or {}).get("Id") or "")
+            if target_id.startswith("i-"):
+                instance_ids.append(target_id)
+            elif re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", target_id):
+                private_ips.append(target_id)
+            elif target_id.startswith("arn:") and ":lambda:" in target_id:
+                add_context_request(requests, service="lambda", operation="get-function", arguments=["--function-name", target_id], reason="Collect Lambda target configuration.", required=False, region=region)
+        if instance_ids:
+            add_context_request(requests, service="ec2", operation="describe-instances", arguments=["--instance-ids", *sorted(set(instance_ids))], reason="Resolve instance-type target-group members.", region=region)
+        for private_ip in sorted(set(private_ips)):
+            add_context_request(requests, service="ec2", operation="describe-network-interfaces", arguments=["--filters", f"Name=addresses.private-ip-address,Values={private_ip}"], reason="Resolve IP-type target-group members to task ENIs.", required=False, region=region)
+        return requests
+    if request.service == "wafv2" and request.operation == "get-web-acl":
+        requests = []
+        for statement in nested_values(response.get("WebACL", {}), "IPSetReferenceStatement"):
+            arn = str(statement.get("ARN") or "") if isinstance(statement, dict) else ""
+            match = re.match(
+                r"arn:[^:]+:wafv2:[^:]+:\d{12}:(regional|global)/ipset/([^/]+)/([^/]+)$",
+                arn,
+            )
+            if match:
+                add_context_request(requests, service="wafv2", operation="get-ip-set", arguments=["--scope", "REGIONAL" if match.group(1) == "regional" else "CLOUDFRONT", "--name", match.group(2), "--id", match.group(3)], reason="Collect WAF IP-set addresses referenced by the selected Web ACL.", required=False, region=region)
         return requests
     if request.service == "eks" and request.operation == "describe-cluster":
         config = response.get("cluster", {}).get("resourcesVpcConfig", {})
@@ -1466,7 +2023,10 @@ def collect_context(
         }
         if completed.returncode == 0:
             try:
-                entry["response"] = json.loads(completed.stdout or "{}")
+                parsed_response = json.loads(completed.stdout or "{}")
+                entry["response"] = sanitize_context_response(
+                    request, parsed_response
+                )
                 entry["status"] = "COLLECTED"
                 queue.extend(expand_context_response(request, entry["response"]))
             except json.JSONDecodeError:
@@ -1488,6 +2048,144 @@ def collect_context(
             for status in sorted({item["status"] for item in results})
         },
     }
+
+
+def sanitize_context_response(
+    request: ContextRequest, response: dict[str, Any]
+) -> dict[str, Any]:
+    """Remove credential-like values before Context evidence is persisted."""
+    sanitized = json.loads(json.dumps(response, default=str))
+    if request.service == "ecs" and request.operation == "describe-task-definition":
+        definition = sanitized.get("taskDefinition", {})
+        for container in definition.get("containerDefinitions", []):
+            for item in container.get("environment", []):
+                key = str(item.get("name") or "")
+                if re.search(
+                    r"(?:secret|password|passwd|token|api.?key|private.?key)",
+                    key,
+                    re.I,
+                ):
+                    item["value"] = "REDACTED_SYNTHETIC_REQUIRED"
+    if request.service == "ec2" and request.operation in {
+        "describe-instance-attribute",
+        "describe-launch-template-versions",
+    }:
+        if "UserData" in sanitized:
+            value = str((sanitized.get("UserData") or {}).get("Value") or "")
+            sanitized["UserData"] = {
+                "Redacted": True,
+                "Sha256": sha256_bytes(value.encode("utf-8")) if value else None,
+            }
+        for version in sanitized.get("LaunchTemplateVersions", []):
+            data = version.get("LaunchTemplateData", {})
+            if data.get("UserData"):
+                value = str(data["UserData"])
+                data["UserData"] = {
+                    "Redacted": True,
+                    "Sha256": sha256_bytes(value.encode("utf-8")),
+                }
+    if request.service == "lambda" and request.operation == "get-function":
+        code = sanitized.get("Code", {})
+        if code.get("Location"):
+            code["Location"] = "REDACTED_EPHEMERAL_DOWNLOAD_URL"
+    return sanitized
+
+
+def context_inventory(evidence: dict[str, Any] | None) -> dict[str, Any]:
+    """Build a compact, secret-free inventory from collected read-only responses."""
+    inventory: dict[str, Any] = {
+        "ecs_clusters": [],
+        "ecs_services": [],
+        "ecs_tasks": [],
+        "ecs_task_definitions": [],
+        "ecr_images": [],
+        "load_balancers": [],
+        "listeners": [],
+        "target_groups": [],
+        "rds_instances": [],
+        "rds_snapshots": [],
+        "secrets_metadata": [],
+        "safety": {
+            "secret_values_collected": False,
+            "ssm_values_collected": False,
+            "mutating_operations_executed": False,
+        },
+    }
+    if not evidence:
+        return inventory
+    for item in evidence.get("results", []):
+        if item.get("status") != "COLLECTED":
+            continue
+        operation = item.get("request", {}).get("operation")
+        response = item.get("response", {})
+        if operation == "describe-clusters":
+            inventory["ecs_clusters"].extend(response.get("clusters", []))
+        elif operation == "describe-services":
+            inventory["ecs_services"].extend(response.get("services", []))
+        elif operation == "describe-tasks":
+            inventory["ecs_tasks"].extend(response.get("tasks", []))
+        elif operation == "describe-task-definition" and response.get("taskDefinition"):
+            inventory["ecs_task_definitions"].append(response["taskDefinition"])
+        elif operation in {"describe-images", "batch-get-image"}:
+            images = response.get("imageDetails", response.get("images", []))
+            inventory["ecr_images"].extend(images)
+        elif operation == "describe-load-balancers":
+            inventory["load_balancers"].extend(response.get("LoadBalancers", []))
+        elif operation == "describe-listeners":
+            inventory["listeners"].extend(response.get("Listeners", []))
+        elif operation == "describe-target-groups":
+            inventory["target_groups"].extend(response.get("TargetGroups", []))
+        elif operation == "describe-db-instances":
+            inventory["rds_instances"].extend(response.get("DBInstances", []))
+        elif operation == "describe-db-snapshots":
+            inventory["rds_snapshots"].extend(response.get("DBSnapshots", []))
+        elif operation == "describe-secret":
+            inventory["secrets_metadata"].append(
+                {
+                    key: response.get(key)
+                    for key in (
+                        "ARN",
+                        "Name",
+                        "Description",
+                        "KmsKeyId",
+                        "RotationEnabled",
+                        "RotationLambdaARN",
+                        "Tags",
+                    )
+                    if key in response
+                }
+            )
+    for key, values in inventory.items():
+        if not isinstance(values, list):
+            continue
+        unique: dict[str, Any] = {}
+        for index, value in enumerate(values):
+            if not isinstance(value, dict):
+                unique[str(index)] = value
+                continue
+            identity = next(
+                (
+                    str(value.get(field))
+                    for field in (
+                        "clusterArn",
+                        "serviceArn",
+                        "taskArn",
+                        "taskDefinitionArn",
+                        "imageDigest",
+                        "LoadBalancerArn",
+                        "ListenerArn",
+                        "TargetGroupArn",
+                        "DBInstanceArn",
+                        "DBSnapshotArn",
+                        "ARN",
+                    )
+                    if value.get(field)
+                ),
+                json.dumps(value, sort_keys=True, default=str),
+            )
+            unique[identity] = value
+        inventory[key] = list(unique.values())
+    return inventory
 
 TF_HEADER = r'''terraform {
   required_version = ">= 1.6.0"
@@ -2687,11 +3385,412 @@ resource "aws_network_acl_association" "{assoc_address}" {{
 ''')
     return "\n".join(blocks), subnet_refs, sg_refs, coverage, sorted(set(blockers))
 
+
+def resolved_ecr_image(
+    evidence: dict[str, Any] | None, source_image: str
+) -> str:
+    parsed = ecr_image_reference(source_image)
+    if not parsed or not evidence:
+        return source_image
+    repository = parsed["repository"]
+    registry = parsed["registry"]
+    for item in evidence.get("results", []):
+        if item.get("status") != "COLLECTED":
+            continue
+        request = item.get("request", {})
+        if request.get("service") != "ecr":
+            continue
+        arguments = request.get("arguments", [])
+        try:
+            requested_repository = arguments[arguments.index("--repository-name") + 1]
+        except (ValueError, IndexError):
+            continue
+        if requested_repository != repository:
+            continue
+        response = item.get("response", {})
+        images = response.get("images", response.get("imageDetails", []))
+        for image in images:
+            image_id = image.get("imageId", image)
+            digest = str(image_id.get("imageDigest") or "")
+            if digest:
+                return (
+                    f"{registry}.dkr.ecr.{parsed['region']}.amazonaws.com/"
+                    f"{repository}@{digest}"
+                )
+    return source_image
+
+
+def render_integrated_services_from_context(
+    *,
+    scenario: Scenario,
+    nodes: dict[str, Node],
+    addresses: dict[str, str],
+    selected_edges: list[Edge],
+    context_evidence: dict[str, Any] | None,
+    mirror_spec: dict[str, Any] | None,
+    network_subnet_refs: dict[str, str],
+    network_sg_refs: dict[str, str],
+) -> tuple[str, list[dict[str, Any]], list[str], str | None]:
+    if not context_evidence:
+        return "", [], [], None
+    inventory = context_inventory(context_evidence)
+    services = inventory["ecs_services"]
+    task_definitions = {
+        str(value.get("taskDefinitionArn")): value
+        for value in inventory["ecs_task_definitions"]
+        if value.get("taskDefinitionArn")
+    }
+    runtime = (mirror_spec or {}).get("selected_runtime_path", {})
+    runtime = runtime if isinstance(runtime, dict) else {}
+    wanted_services = {
+        str(key).removesuffix("_task_id").lower()
+        for key, value in runtime.items()
+        if str(key).endswith("_task_id") and value
+    }
+    wanted_services.update(
+        {
+            str(node.properties.get("service")).lower()
+            for node in nodes.values()
+            if node.primary_kind == "RNR_AppEndpoint"
+            and node.properties.get("service")
+            and str(node.properties.get("service")).lower() != "result"
+        }
+    )
+    selected_services = [
+        value
+        for value in services
+        if not wanted_services
+        or any(
+            name in str(value.get("serviceName") or "").lower()
+            for name in wanted_services
+        )
+    ]
+    if not selected_services or not task_definitions:
+        return "", [], ["ECS_RUNTIME_CONTEXT_REQUIRED"], None
+
+    blocks: list[str] = []
+    coverage: list[dict[str, Any]] = []
+    blockers: list[str] = []
+    cluster_arns = sorted(
+        {
+            str(value.get("clusterArn"))
+            for value in selected_services
+            if value.get("clusterArn")
+        }
+    )
+    cluster_refs: dict[str, str] = {}
+    for cluster_arn in cluster_arns:
+        address = network_tf_address("ecs_cluster", cluster_arn.rsplit("/", 1)[-1])
+        blocks.append(f'''
+resource "aws_ecs_cluster" "{address}" {{
+  name = substr("${{local.prefix}}-{address}", 0, 255)
+}}
+''')
+        cluster_refs[cluster_arn] = f"aws_ecs_cluster.{address}.id"
+        coverage.append({"resource": cluster_arn, "status": "CONTEXT_REPRODUCIBLE", "kind": "ECS_CLUSTER"})
+    primary_cluster_ref = next(iter(cluster_refs.values()), None)
+
+    blocks.append('''
+resource "aws_iam_role" "mirror_ecs_execution" {
+  name = substr("${local.prefix}-ecs-execution", 0, 64)
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "mirror_ecs_execution" {
+  role       = aws_iam_role.mirror_ecs_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+''')
+
+    role_refs = {
+        node.arn: f"aws_iam_role.{addresses[node_id]}.arn"
+        for node_id, node in nodes.items()
+        if node_id in addresses and node.primary_kind == "AWS_Role" and node.arn
+    }
+    task_definition_refs: dict[str, str] = {}
+    for source_arn, definition in task_definitions.items():
+        if source_arn not in {
+            str(service.get("taskDefinition")) for service in selected_services
+        }:
+            continue
+        family = str(definition.get("family") or source_arn.rsplit("/", 1)[-1].split(":", 1)[0])
+        address = network_tf_address("task", family)
+        containers: list[dict[str, Any]] = []
+        for source_container in definition.get("containerDefinitions", []):
+            container: dict[str, Any] = {}
+            for key in (
+                "name",
+                "cpu",
+                "memory",
+                "memoryReservation",
+                "essential",
+                "portMappings",
+                "command",
+                "entryPoint",
+                "healthCheck",
+                "workingDirectory",
+                "readonlyRootFilesystem",
+                "user",
+            ):
+                if key in source_container:
+                    container[key] = source_container[key]
+            source_image = str(source_container.get("image") or "")
+            container["image"] = resolved_ecr_image(context_evidence, source_image)
+            environment: list[dict[str, str]] = []
+            for item in source_container.get("environment", []):
+                key = str(item.get("name") or "")
+                value = str(item.get("value") or "")
+                if re.search(r"(?:secret|password|passwd|token|api.?key|private.?key)", key, re.I):
+                    value = "SYNTHETIC_REPLACE_ME"
+                    blockers.append(f"SENSITIVE_ENV_REPLACED:{family}:{key}")
+                environment.append({"name": key, "value": value})
+            if environment:
+                container["environment"] = environment
+            if source_container.get("secrets"):
+                blockers.append(f"TASK_SECRET_CONTRACT_REQUIRED:{family}")
+            containers.append(container)
+            if "@sha256:" not in container["image"]:
+                blockers.append(f"IMMUTABLE_IMAGE_DIGEST_REQUIRED:{family}:{container.get('name', 'container')}")
+        task_role = role_refs.get(str(definition.get("taskRoleArn") or ""))
+        if definition.get("taskRoleArn") and not task_role:
+            blockers.append(f"TASK_ROLE_MAPPING_REQUIRED:{family}")
+        if definition.get("volumes"):
+            blockers.append(f"TASK_VOLUME_ADAPTER_REQUIRED:{family}")
+        optional_lines: list[str] = []
+        if definition.get("cpu") is not None:
+            optional_lines.append(f"  cpu                      = {json.dumps(str(definition['cpu']))}")
+        if definition.get("memory") is not None:
+            optional_lines.append(f"  memory                   = {json.dumps(str(definition['memory']))}")
+        if task_role:
+            optional_lines.append(f"  task_role_arn            = {task_role}")
+        requires = definition.get("requiresCompatibilities") or ["EC2"]
+        blocks.append(f'''
+resource "aws_ecs_task_definition" "{address}" {{
+  family                   = substr("${{local.prefix}}-{address}", 0, 255)
+  network_mode             = {json.dumps(str(definition.get('networkMode') or 'awsvpc'))}
+  requires_compatibilities = {json.dumps(requires)}
+  execution_role_arn       = aws_iam_role.mirror_ecs_execution.arn
+{chr(10).join(optional_lines)}
+  container_definitions    = jsonencode({json.dumps(containers, ensure_ascii=False)})
+}}
+''')
+        task_definition_refs[source_arn] = f"aws_ecs_task_definition.{address}.arn"
+        coverage.append({"resource": source_arn, "status": "SEMANTIC_MIRROR", "kind": "ECS_TASK_DEFINITION"})
+
+    target_group_refs: dict[str, str] = {}
+    load_balancer_refs: dict[str, str] = {}
+    network_model = network_model_from_context(context_evidence)
+    selected_lb_arns = {
+        node.arn
+        for node in nodes.values()
+        if node.primary_kind == "RNR_LoadBalancer" and node.arn
+    }
+    for load_balancer in inventory["load_balancers"]:
+        source_arn = str(load_balancer.get("LoadBalancerArn") or "")
+        if selected_lb_arns and source_arn not in selected_lb_arns:
+            continue
+        address = network_tf_address("lb", source_arn.rsplit("/", 2)[-2] if source_arn else "mirror")
+        subnet_values = [
+            network_subnet_refs.get(str(zone.get("SubnetId") or ""))
+            for zone in load_balancer.get("AvailabilityZones", [])
+        ]
+        subnet_values = [value for value in subnet_values if value]
+        group_values = [
+            network_sg_refs.get(str(group_id))
+            for group_id in load_balancer.get("SecurityGroups", [])
+        ]
+        group_values = [value for value in group_values if value]
+        if len(subnet_values) < 2 or not group_values:
+            blockers.append("ALB_NETWORK_CONTEXT_REQUIRED")
+            continue
+        blocks.append(f'''
+resource "aws_lb" "{address}" {{
+  name               = substr("${{local.prefix}}-alb", 0, 32)
+  internal           = {str(str(load_balancer.get('Scheme')) == 'internal').lower()}
+  load_balancer_type = {json.dumps(str(load_balancer.get('Type') or 'application'))}
+  subnets            = [{', '.join(subnet_values)}]
+  security_groups    = [{', '.join(group_values)}]
+}}
+''')
+        load_balancer_refs[source_arn] = f"aws_lb.{address}.arn"
+        coverage.append({"resource": source_arn, "status": "CONTEXT_REPRODUCIBLE", "kind": "ALB"})
+    for target_group in inventory["target_groups"]:
+        source_arn = str(target_group.get("TargetGroupArn") or "")
+        vpc_id = str(target_group.get("VpcId") or "")
+        if vpc_id not in network_model["vpcs"]:
+            blockers.append(f"TARGET_GROUP_VPC_CONTEXT_REQUIRED:{source_arn}")
+            continue
+        address = network_tf_address("tg", str(target_group.get("TargetGroupName") or source_arn))
+        blocks.append(f'''
+resource "aws_lb_target_group" "{address}" {{
+  name        = substr("${{local.prefix}}-{address}", 0, 32)
+  port        = {int(target_group.get('Port') or 80)}
+  protocol    = {json.dumps(str(target_group.get('Protocol') or 'HTTP'))}
+  target_type = {json.dumps(str(target_group.get('TargetType') or 'ip'))}
+  vpc_id      = aws_vpc.{network_tf_address('vpc', vpc_id)}.id
+
+  health_check {{
+    enabled             = {str(bool(target_group.get('HealthCheckEnabled', True))).lower()}
+    path                = {json.dumps(str(target_group.get('HealthCheckPath') or '/'))}
+    protocol            = {json.dumps(str(target_group.get('HealthCheckProtocol') or 'HTTP'))}
+    healthy_threshold   = {int(target_group.get('HealthyThresholdCount') or 2)}
+    unhealthy_threshold = {int(target_group.get('UnhealthyThresholdCount') or 2)}
+    timeout             = {int(target_group.get('HealthCheckTimeoutSeconds') or 5)}
+    interval            = {int(target_group.get('HealthCheckIntervalSeconds') or 30)}
+  }}
+}}
+''')
+        target_group_refs[source_arn] = f"aws_lb_target_group.{address}.arn"
+        coverage.append({"resource": source_arn, "status": "CONTEXT_REPRODUCIBLE", "kind": "TARGET_GROUP"})
+    for listener in inventory["listeners"]:
+        source_lb = str(listener.get("LoadBalancerArn") or "")
+        lb_ref = load_balancer_refs.get(source_lb)
+        if not lb_ref:
+            continue
+        protocol = str(listener.get("Protocol") or "HTTP")
+        if protocol not in {"HTTP", "TCP"}:
+            blockers.append(f"LISTENER_CERTIFICATE_ADAPTER_REQUIRED:{protocol}")
+            continue
+        forward = next(
+            (
+                action
+                for action in listener.get("DefaultActions", [])
+                if action.get("Type") == "forward"
+            ),
+            None,
+        )
+        source_tg = str((forward or {}).get("TargetGroupArn") or "")
+        tg_ref = target_group_refs.get(source_tg)
+        if not tg_ref:
+            blockers.append(f"LISTENER_ACTION_MAPPING_REQUIRED:{listener.get('ListenerArn')}")
+            continue
+        address = network_tf_address("listener", str(listener.get("ListenerArn") or protocol))
+        blocks.append(f'''
+resource "aws_lb_listener" "{address}" {{
+  load_balancer_arn = {lb_ref}
+  port              = {int(listener.get('Port') or 80)}
+  protocol          = {json.dumps(protocol)}
+
+  default_action {{
+    type             = "forward"
+    target_group_arn = {tg_ref}
+  }}
+}}
+''')
+
+    for service in selected_services:
+        source_arn = str(service.get("serviceArn") or "")
+        service_name = str(service.get("serviceName") or source_arn.rsplit("/", 1)[-1])
+        address = network_tf_address("service", service_name)
+        cluster_ref = cluster_refs.get(str(service.get("clusterArn") or "")) or primary_cluster_ref
+        task_ref = task_definition_refs.get(str(service.get("taskDefinition") or ""))
+        if not cluster_ref or not task_ref:
+            blockers.append(f"ECS_SERVICE_BINDING_REQUIRED:{service_name}")
+            continue
+        lines = [
+            f'resource "aws_ecs_service" "{address}" {{',
+            f'  name            = substr("${{local.prefix}}-{address}", 0, 255)',
+            f"  cluster         = {cluster_ref}",
+            f"  task_definition = {task_ref}",
+            "  desired_count   = 1",
+            f"  launch_type     = {json.dumps(str(service.get('launchType') or 'EC2'))}",
+        ]
+        network = service.get("networkConfiguration", {}).get("awsvpcConfiguration", {})
+        subnet_values = [network_subnet_refs.get(str(value)) for value in network.get("subnets", [])]
+        subnet_values = [value for value in subnet_values if value]
+        group_values = [network_sg_refs.get(str(value)) for value in network.get("securityGroups", [])]
+        group_values = [value for value in group_values if value]
+        if subnet_values and group_values:
+            lines.extend(
+                [
+                    "  network_configuration {",
+                    f"    subnets          = [{', '.join(subnet_values)}]",
+                    f"    security_groups  = [{', '.join(group_values)}]",
+                    "    assign_public_ip = false",
+                    "  }",
+                ]
+            )
+        for binding in service.get("loadBalancers", []):
+            tg_ref = target_group_refs.get(str(binding.get("targetGroupArn") or ""))
+            if tg_ref:
+                lines.extend(
+                    [
+                        "  load_balancer {",
+                        f"    target_group_arn = {tg_ref}",
+                        f"    container_name   = {json.dumps(str(binding.get('containerName') or ''))}",
+                        f"    container_port   = {int(binding.get('containerPort') or 80)}",
+                        "  }",
+                    ]
+                )
+        lines.append("}")
+        blocks.append("\n".join(lines) + "\n")
+        coverage.append({"resource": source_arn, "status": "SEMANTIC_MIRROR", "kind": "ECS_SERVICE"})
+
+    external_cidrs = [
+        str(node.properties.get("cidr"))
+        for node in nodes.values()
+        if node.primary_kind == "RNR_ExternalSource" and node.properties.get("cidr")
+    ]
+    if load_balancer_refs and external_cidrs:
+        lb_ref = next(iter(load_balancer_refs.values()))
+        blocks.append(f'''
+resource "aws_wafv2_ip_set" "authorized_client" {{
+  name               = substr("${{local.prefix}}-authorized-client", 0, 128)
+  scope              = "REGIONAL"
+  ip_address_version = "IPV4"
+  addresses          = {json.dumps(external_cidrs)}
+}}
+
+resource "aws_wafv2_web_acl" "mirror" {{
+  name  = substr("${{local.prefix}}-web-acl", 0, 128)
+  scope = "REGIONAL"
+
+  default_action {{ block {{}} }}
+
+  rule {{
+    name     = "AllowAuthorizedClient"
+    priority = 1
+    action {{ allow {{}} }}
+    statement {{
+      ip_set_reference_statement {{
+        arn = aws_wafv2_ip_set.authorized_client.arn
+      }}
+    }}
+    visibility_config {{
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AllowAuthorizedClient"
+      sampled_requests_enabled   = true
+    }}
+  }}
+
+  visibility_config {{
+    cloudwatch_metrics_enabled = true
+    metric_name                = "MirrorWebACL"
+    sampled_requests_enabled   = true
+  }}
+}}
+
+resource "aws_wafv2_web_acl_association" "mirror" {{
+  resource_arn = {lb_ref}
+  web_acl_arn  = aws_wafv2_web_acl.mirror.arn
+}}
+''')
+        coverage.append({"resource": "RNR_WAFWebACL", "status": "SEMANTIC_MIRROR", "kind": "WAF"})
+    return "\n".join(blocks), coverage, sorted(set(blockers)), primary_cluster_ref
+
 def generic_terraform(
     scenario: Scenario,
     nodes: dict[str, Node],
     edges: list[Edge],
     context_evidence: dict[str, Any] | None = None,
+    mirror_spec: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     selected_nodes = {node_id: nodes[node_id] for node_id in scenario.node_ids}
     selected_edges = [
@@ -2715,6 +3814,25 @@ def generic_terraform(
     if network_hcl:
         blocks.append(network_hcl)
     blockers.extend(network_blockers)
+    integrated_hcl, integrated_coverage, integrated_blockers, ecs_cluster_ref = (
+        render_integrated_services_from_context(
+            scenario=scenario,
+            nodes=selected_nodes,
+            addresses=addresses,
+            selected_edges=selected_edges,
+            context_evidence=context_evidence,
+            mirror_spec=mirror_spec,
+            network_subnet_refs=network_subnet_refs,
+            network_sg_refs=network_sg_refs,
+        )
+    )
+    if integrated_hcl:
+        blocks.append(integrated_hcl)
+    blockers.extend(integrated_blockers)
+    integrated_kinds = {
+        str(value.get("kind")) for value in integrated_coverage
+    }
+    inventory_services = list(context_inventory(context_evidence).get("ecs_services", []))
 
     def add_coverage(node: Node, status: str, reason: str) -> None:
         coverage_nodes.append(
@@ -2743,7 +3861,20 @@ def generic_terraform(
                 or node.properties.get("image_digest")
                 or ""
             )
-            if workload_id and artifact:
+            service_name = str(node.properties.get("service") or "").lower()
+            matched_service = next(
+                (
+                    value
+                    for value in inventory_services
+                    if service_name
+                    and service_name
+                    in str(value.get("serviceName") or "").lower()
+                ),
+                None,
+            )
+            if matched_service and "ECS_SERVICE" in integrated_kinds:
+                add_coverage(node, "CONTEXT_REPRODUCIBLE", "The read-only collector bound this endpoint to an ECS service and task definition rendered into Terraform.")
+            elif workload_id and artifact:
                 add_coverage(node, "ADAPTER_INPUT_PRESENT", "Endpoint has an explicit workload binding and immutable artifact reference for a service-specific adapter.")
                 blockers.append(f"APP_WORKLOAD_ADAPTER_REQUIRED:{node_name(node)}")
             else:
@@ -2769,7 +3900,8 @@ def generic_terraform(
                 "CONTEXT_COLLECTED" if collected else "CONTEXT_REQUIRED",
                 "ALB ARN is usable for read-only listener, target-group and network collection; workload targets still require binding.",
             )
-            blockers.append(f"LOAD_BALANCER_RENDERER_REQUIRED:{node_name(node)}")
+            if "ALB" not in integrated_kinds:
+                blockers.append(f"LOAD_BALANCER_RENDERER_REQUIRED:{node_name(node)}")
         elif kind == "RNR_WAFWebACL":
             collected = any(
                 item.get("status") == "COLLECTED"
@@ -2781,7 +3913,8 @@ def generic_terraform(
                 "CONTEXT_COLLECTED" if collected else "CONTEXT_REQUIRED",
                 "WAF ARN is usable for read-only rule collection; referenced IP sets and managed rule dependencies must also be portable.",
             )
-            blockers.append(f"WAF_RENDERER_REQUIRED:{node_name(node)}")
+            if "WAF" not in integrated_kinds:
+                blockers.append(f"WAF_RENDERER_REQUIRED:{node_name(node)}")
         elif kind == "RNR_SecurityGroup":
             group_id = str(node.properties.get("group_id") or "")
             if group_id in network_sg_refs:
@@ -3134,6 +4267,33 @@ resource "aws_security_group" "generic" {
                 if isinstance(item, dict) and item.get("GroupId")
             ]
             mapped_groups = [network_sg_refs[item] for item in source_group_ids if item in network_sg_refs]
+            role_id = next(
+                (
+                    edge.end
+                    for edge in selected_edges
+                    if edge.kind == "AWS_RunsAs"
+                    and edge.start == node.id
+                    and selected_nodes[edge.end].primary_kind == "AWS_Role"
+                ),
+                None,
+            )
+            profile_line = ""
+            user_data_line = ""
+            if role_id:
+                profile_address = network_tf_address("instance_profile", address)
+                blocks.append(f'''
+resource "aws_iam_instance_profile" "{profile_address}" {{
+  name = substr("${{local.prefix}}-{profile_address}", 0, 128)
+  role = aws_iam_role.{addresses[role_id]}.name
+}}
+''')
+                profile_line = f"  iam_instance_profile   = aws_iam_instance_profile.{profile_address}.name\n"
+            if ecs_cluster_ref:
+                user_data_line = f'''  user_data = <<-USERDATA
+#!/bin/bash
+echo "ECS_CLUSTER=${{{ecs_cluster_ref.replace('.id', '.name')}}}" >> /etc/ecs/ecs.config
+USERDATA
+'''
             group_line = (
                 "  vpc_security_group_ids = [" + ", ".join(mapped_groups) + "]\n"
                 if mapped_groups
@@ -3149,6 +4309,7 @@ resource "aws_instance" "{address}" {{
   instance_type          = {json.dumps(str(node.properties.get('instance_type') or 't3.micro'))}
   subnet_id              = {subnet_expression}
 {group_line}
+{profile_line}{user_data_line}
 
   lifecycle {{
     precondition {{
@@ -3264,10 +4425,12 @@ resource "aws_iam_access_key" "starting" {{
         "overall": "CONTEXT_REQUIRED" if blockers else "SEMANTIC_MIRROR_READY",
         "nodes": coverage_nodes,
         "network": network_coverage,
+        "integrated_services": integrated_coverage,
         "edges": coverage_edges,
         "blockers": blockers,
         "required_inputs": required_inputs_list,
         "warning": "Semantic equivalence is targeted; source IDs, secrets, key material, and business data are not cloned.",
+        "validation_steps": list((mirror_spec or {}).get("steps", [])),
     }
     variable_extra = r'''
 
@@ -3328,6 +4491,7 @@ def terraform_files(
     nodes: dict[str, Node],
     edges: list[Edge],
     context_evidence: dict[str, Any] | None = None,
+    mirror_spec: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     renderers = {
         "lambda_update_invoke_admin": lambda: lambda_terraform(scenario, nodes),
@@ -3335,8 +4499,8 @@ def terraform_files(
         "iam_create_access_key_s3": lambda: create_key_terraform(scenario),
         "role_chain_s3": lambda: role_chain_terraform(scenario),
         "ec2_passrole_spot_admin": lambda: ec2_terraform(scenario),
-        "generic_awshound_path": lambda: generic_terraform(scenario, nodes, edges, context_evidence),
-        "integrated_rnr_path": lambda: generic_terraform(scenario, nodes, edges, context_evidence),
+        "generic_awshound_path": lambda: generic_terraform(scenario, nodes, edges, context_evidence, mirror_spec),
+        "integrated_rnr_path": lambda: generic_terraform(scenario, nodes, edges, context_evidence, mirror_spec),
     }
     renderer = renderers.get(scenario.scenario_type)
     if not renderer:
